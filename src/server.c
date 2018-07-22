@@ -1746,8 +1746,9 @@ static int server_agent_check_init(const char *file, int linenum,
 {
 	const char *ret;
 
-	if (!srv->do_agent)
+	if (!srv->do_agent) {
 		return 0;
+	}
 
 	if (!srv->agent.port) {
 		ha_alert("parsing [%s:%d] : server %s does not have agent port. Agent check has been disabled.\n",
@@ -2706,6 +2707,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 	const char *fqdn;
 	const char *port_str;
 	unsigned int port;
+	const char *srvrecord;
 
 	fqdn = NULL;
 	port = 0;
@@ -2729,6 +2731,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			 * srv_f_forced_id:      params[12]
 			 * srv_fqdn:             params[13]
 			 * srv_port:             params[14]
+			 * srvrecord:            params[15]
 			 */
 
 			/* validating srv_op_state */
@@ -2852,6 +2855,10 @@ static void srv_update_state(struct server *srv, int version, char **params)
 				fqdn = NULL;
 			}
 
+			/* don't apply anything if one error has been detected */
+			if (msg->data)
+				goto out;
+
 			port_str = params[14];
 			if (port_str) {
 				port = strl2uic(port_str, strlen(port_str));
@@ -2861,9 +2868,13 @@ static void srv_update_state(struct server *srv, int version, char **params)
 				}
 			}
 
-			/* don't apply anything if one error has been detected */
-			if (msg->data)
-				goto out;
+			/* SRV record
+			 * NOTE: in HAProxy, SRV records must start with an underscore '_'
+			 */
+			srvrecord = params[15];
+			if (srvrecord && *srvrecord != '_')
+				srvrecord = NULL;
+
 
 			HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 			/* recover operational state and apply it to this server
@@ -2964,8 +2975,13 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			server_recalc_eweight(srv);
 
 			/* load server IP address */
-			if (strcmp(params[0], "-"))
-				srv->lastaddr = strdup(params[0]);
+			if (strcmp(params[0], "-")) {
+				if (srvrecord && *srvrecord != '_') {
+					// FOR SRV We do not store the record... if srv is not starting with '_'
+				} else {
+					srv->lastaddr = strdup(params[0]);
+				}
+			}
 
 			if (fqdn && srv->hostname) {
 				if (!strcmp(srv->hostname, fqdn)) {
@@ -2991,6 +3007,42 @@ static void srv_update_state(struct server *srv, int version, char **params)
 						srv_set_fqdn(srv, fqdn, 0);
 						srv->next_admin |= SRV_ADMF_HMAINT;
 					}
+				}
+			} else if (fqdn && !srv->hostname && srvrecord) {
+				ha_alert("in srvrecord check for... %s\n", fqdn);
+				int res;
+
+				// we can't apply previous state if SRV record has changed 
+				if (srv->srvrq && strcmp(srv->srvrq->name, srvrecord) != 0) {
+					chunk_appendf(msg, ", SRV record mismatch between configuration ('%s') and state file ('%s) for server '%s'. Previous state not applied", srv->srvrq->name, srvrecord, srv->id);
+					HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
+					goto out;
+				}
+
+				// create or find a SRV resolution for this srv record
+				if (srv->srvrq == NULL && (srv->srvrq = find_srvrq_by_name(srvrecord, srv->proxy)) == NULL)
+					srv->srvrq = new_dns_srvrq(srv, srvrecord);
+
+				if (srv->srvrq == NULL) {
+					chunk_appendf(msg, ", can't create or find SRV resolution '%s' for server '%s'", srvrecord, srv->id);
+					HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
+					goto out;
+				}
+
+				// prepare DNS resolution for this server  (but aint this has already been done by the server-template function?)
+				res = srv_prepare_for_resolution(srv, fqdn);
+				if (res == -1) {
+					ha_alert("could not allocate memory for DNS REsolution for server ... '%s'\n", srv->id);
+					chunk_appendf(msg, ", can't allocate memory for DNS resolution for server '%s'", srv->id);
+					HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
+					goto out;
+				}
+
+				// configure check.port accordingly 
+				if ((srv->check.state & CHK_ST_CONFIGURED) &&
+				    !(srv->flags & SRV_F_CHECKPORT)) {
+					ha_alert("OK SET CHECK PORT TO ....\n");
+					srv->check.port = port;
 				}
 			}
 
@@ -3744,6 +3796,7 @@ int snr_resolution_cb(struct dns_requester *requester, struct dns_nameserver *na
 	}
 	else
 		chunk_printf(chk, "DNS cache");
+
 	update_server_addr(s, firstip, firstip_sin_family, (char *) chk->area);
 
  update_status:

@@ -1421,7 +1421,7 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
  * It uses the proxy pointer from cli.p0, the proxy's id from cli.i0 and the server's
  * pointer from cli.p1.
  */
-static int dump_servers_state(struct stream_interface *si, struct buffer *buf)
+static int dump_servers_state(struct stream_interface *si, struct chunk *buf)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct proxy *px = appctx->ctx.cli.p0;
@@ -1429,6 +1429,7 @@ static int dump_servers_state(struct stream_interface *si, struct buffer *buf)
 	char srv_addr[INET6_ADDRSTRLEN + 1];
 	time_t srv_time_since_last_change;
 	int bk_f_forced_id, srv_f_forced_id;
+	char *srvrecord;
 
 	/* we don't want to report any state if the backend is not enabled on this process */
 	if (px->bind_proc && !(px->bind_proc & pid_bit))
@@ -1458,18 +1459,24 @@ static int dump_servers_state(struct stream_interface *si, struct buffer *buf)
 		bk_f_forced_id = px->options & PR_O_FORCED_ID ? 1 : 0;
 		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
 
+		srvrecord = NULL;
+		if (srv->srvrq && srv->srvrq->name)
+			srvrecord = srv->srvrq->name;
+
+		unsigned int zero = 0;
 		chunk_appendf(buf,
 				"%d %s "
 				"%d %s %s "
 				"%d %d %d %d %ld "
 				"%d %d %d %d %d "
-				"%d %d %s %u"
+				"%d %d %s %u %s"
 				"\n",
 				px->uuid, px->id,
 				srv->puid, srv->id, srv_addr,
 				srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight, (long int)srv_time_since_last_change,
 				srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
-				bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-", srv->svc_port);
+				bk_f_forced_id, srv_f_forced_id, srvrecord ? "-" : srv->hostname ? srv->hostname : "-",  srvrecord ? srv->svc_port : srv->svc_port, srvrecord ? srvrecord : "-");
+				// bk_f_forced_id, srv_f_forced_id, srvrecord ? "-" : srv->hostname ? srv->hostname : "-",  srvrecord ? zero : srv->svc_port, srvrecord ? srvrecord : "-");
 		if (ci_putchk(si_ic(si), &trash) == -1) {
 			si_applet_cant_put(si);
 			return 0;
