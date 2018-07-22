@@ -2862,10 +2862,10 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			port_str = params[14];
 			if (port_str) {
 				port = strl2uic(port_str, strlen(port_str));
-				if (port > USHRT_MAX) {
-					chunk_appendf(msg, ", invalid srv_port value '%s'", port_str);
-					port_str = NULL;
-				}
+				//if (port > USHRT_MAX) {
+				//	chunk_appendf(msg, ", invalid srv_port value '%s'", port_str);
+				//	port_str = NULL;
+				//}
 			}
 
 			/* SRV record
