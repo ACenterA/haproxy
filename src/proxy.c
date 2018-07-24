@@ -1475,7 +1475,7 @@ static int dump_servers_state(struct stream_interface *si, struct chunk *buf)
 				srv->puid, srv->id, srv_addr,
 				srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight, (long int)srv_time_since_last_change,
 				srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
-				bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-",  srv->svc_port, srvrecord ? srvrecord : "-");
+				bk_f_forced_id, srv_f_forced_id, srvrecord ? "-" : srv->hostname ? srv->hostname : "-",  srv->svc_port, srvrecord ? srvrecord : "-");
 		if (ci_putchk(si_ic(si), &trash) == -1) {
 			si_applet_cant_put(si);
 			return 0;
