@@ -3045,7 +3045,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 				    !(srv->flags & SRV_F_CHECKPORT)) {
 					srv->check.port = port;
 				}
-				srv_set_fqdn(srv, fqdn, 0);
+				//srv_set_fqdn(srv, fqdn, 0);
 			}
 
 			if (port_str)
