@@ -3009,7 +3009,6 @@ static void srv_update_state(struct server *srv, int version, char **params)
 					}
 				}
 			} else if (fqdn && !srv->hostname && srvrecord) {
-				ha_alert("in srvrecord check for... %s\n", fqdn);
 				int res;
 
 				// we can't apply previous state if SRV record has changed 
@@ -3020,8 +3019,9 @@ static void srv_update_state(struct server *srv, int version, char **params)
 				}
 
 				// create or find a SRV resolution for this srv record
-				if (srv->srvrq == NULL && (srv->srvrq = find_srvrq_by_name(srvrecord, srv->proxy)) == NULL)
+				if (srv->srvrq == NULL && (srv->srvrq = find_srvrq_by_name(srvrecord, srv->proxy)) == NULL) {
 					srv->srvrq = new_dns_srvrq(srv, srvrecord);
+				}
 
 				if (srv->srvrq == NULL) {
 					chunk_appendf(msg, ", can't create or find SRV resolution '%s' for server '%s'", srvrecord, srv->id);
@@ -3029,6 +3029,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 					goto out;
 				}
 
+				/*
 				// prepare DNS resolution for this server  (but aint this has already been done by the server-template function?)
 				res = srv_prepare_for_resolution(srv, fqdn);
 				if (res == -1) {
@@ -3037,13 +3038,14 @@ static void srv_update_state(struct server *srv, int version, char **params)
 					HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 					goto out;
 				}
+				*/
 
 				// configure check.port accordingly 
 				if ((srv->check.state & CHK_ST_CONFIGURED) &&
 				    !(srv->flags & SRV_F_CHECKPORT)) {
-					ha_alert("OK SET CHECK PORT TO ....\n");
 					srv->check.port = port;
 				}
+				srv_set_fqdn(srv, fqdn, 0);
 			}
 
 			if (port_str)
