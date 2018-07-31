@@ -23,6 +23,7 @@
 #include <proto/proxy.h>
 #include <proto/stream.h>
 #include <proto/task.h>
+#include <proto/fd.h>
 
 struct pool_head *pool_head_task;
 struct pool_head *pool_head_tasklet;
@@ -33,7 +34,8 @@ struct pool_head *pool_head_tasklet;
 struct pool_head *pool_head_notification;
 
 unsigned int nb_tasks = 0;
-unsigned long active_tasks_mask = 0; /* Mask of threads with active tasks */
+volatile unsigned long active_tasks_mask = 0; /* Mask of threads with active tasks */
+volatile unsigned long global_tasks_mask = 0; /* Mask of threads with tasks in the global runqueue */
 unsigned int tasks_run_queue = 0;
 unsigned int tasks_run_queue_cur = 0;    /* copy of the run queue size */
 unsigned int nb_tasks_cur = 0;     /* copy of the tasks count */
@@ -51,10 +53,10 @@ __decl_hathreads(HA_SPINLOCK_T __attribute__((aligned(64))) wq_lock); /* spin lo
 static struct eb_root timers;      /* sorted timers tree */
 #ifdef USE_THREAD
 struct eb_root rqueue;      /* tree constituting the run queue */
-static int global_rqueue_size; /* Number of element sin the global runqueue */
+int global_rqueue_size; /* Number of element sin the global runqueue */
 #endif
 struct eb_root rqueue_local[MAX_THREADS]; /* tree constituting the per-thread run queue */
-static int rqueue_size[MAX_THREADS]; /* Number of elements in the per-thread run queue */
+int rqueue_size[MAX_THREADS]; /* Number of elements in the per-thread run queue */
 static unsigned int rqueue_ticks;  /* insertion count */
 
 /* Puts the task <t> in run queue at a position depending on t->nice. <t> is
@@ -69,6 +71,7 @@ void __task_wakeup(struct task *t, struct eb_root *root)
 {
 	void *expected = NULL;
 	int *rq_size;
+	unsigned long __maybe_unused old_active_mask;
 
 #ifdef USE_THREAD
 	if (root == &rqueue) {
@@ -118,7 +121,14 @@ redo:
 		return;
 	}
 	HA_ATOMIC_ADD(&tasks_run_queue, 1);
-	active_tasks_mask |= t->thread_mask;
+#ifdef USE_THREAD
+	if (root == &rqueue) {
+		HA_ATOMIC_OR(&global_tasks_mask, t->thread_mask);
+		__ha_barrier_store();
+	}
+#endif
+	old_active_mask = active_tasks_mask;
+	HA_ATOMIC_OR(&active_tasks_mask, t->thread_mask);
 	t->rq.key = HA_ATOMIC_ADD(&rqueue_ticks, 1);
 
 	if (likely(t->nice)) {
@@ -136,6 +146,7 @@ redo:
 #ifdef USE_THREAD
 	if (root == &rqueue) {
 		global_rqueue_size++;
+		HA_ATOMIC_OR(&t->state, TASK_GLOBAL);
 		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
 	} else
 #endif
@@ -144,6 +155,15 @@ redo:
 
 		rqueue_size[nb]++;
 	}
+#ifdef USE_THREAD
+	/* If all threads that are supposed to handle this task are sleeping,
+	 * wake one.
+	 */
+	if ((((t->thread_mask & all_threads_mask) & sleeping_thread_mask) ==
+	    (t->thread_mask & all_threads_mask)) &&
+	    !(t->thread_mask & old_active_mask))
+		wake_thread(my_ffsl((t->thread_mask & all_threads_mask) &~ tid_bit) - 1);
+#endif
 	return;
 }
 
@@ -251,9 +271,6 @@ void process_runnable_tasks()
 {
 	struct task *t;
 	int max_processed;
-#ifdef USE_THREAD
-	uint64_t average = 0;
-#endif
 
 	tasks_run_queue_cur = tasks_run_queue; /* keep a copy for reporting */
 	nb_tasks_cur = nb_tasks;
@@ -268,15 +285,12 @@ void process_runnable_tasks()
 		}
 
 #ifdef USE_THREAD
-		average = tasks_run_queue / global.nbthread;
-
 		/* Get some elements from the global run queue and put it in the
 		 * local run queue. To try to keep a bit of fairness, just get as
 		 * much elements from the global list as to have a bigger local queue
 		 * than the average.
 		 */
-		while ((task_list_size[tid] + rqueue_size[tid]) <= average) {
-
+		while ((task_list_size[tid] + rqueue_size[tid]) * global.nbthread <= tasks_run_queue) {
 			/* we have to restart looking up after every batch */
 			rq_next = eb32sc_lookup_ge(&rqueue, rqueue_ticks - TIMER_LOOK_BACK, tid_bit);
 			if (unlikely(!rq_next)) {
@@ -287,13 +301,14 @@ void process_runnable_tasks()
 				 * of the tree now.
 				 */
 				rq_next = eb32sc_first(&rqueue, tid_bit);
-				if (!rq_next)
+				if (!rq_next) {
+					HA_ATOMIC_AND(&global_tasks_mask, ~tid_bit);
 					break;
+				}
 			}
 
 			t = eb32sc_entry(rq_next, struct task, rq);
 			rq_next = eb32sc_next(rq_next, tid_bit);
-			global_rqueue_size--;
 
 			/* detach the task from the queue */
 			__task_unlink_rq(t);
@@ -308,7 +323,6 @@ void process_runnable_tasks()
 			return;
 		}
 	}
-	active_tasks_mask &= ~tid_bit;
 	/* Get some tasks from the run queue, make sure we don't
 	 * get too much in the task list, but put a bit more than
 	 * the max that will be run, to give a bit more fairness
@@ -342,6 +356,12 @@ void process_runnable_tasks()
 		/* And add it to the local task list */
 		task_insert_into_tasklet_list(t);
 	}
+	if (!(global_tasks_mask & tid_bit) && rqueue_size[tid] == 0) {
+		HA_ATOMIC_AND(&active_tasks_mask, ~tid_bit);
+		__ha_barrier_load();
+		if (global_tasks_mask & tid_bit)
+			HA_ATOMIC_OR(&active_tasks_mask, tid_bit);
+	}
 	while (max_processed > 0 && !LIST_ISEMPTY(&task_list[tid])) {
 		struct task *t;
 		unsigned short state;
@@ -355,7 +375,6 @@ void process_runnable_tasks()
 
 		ctx = t->context;
 		process = t->process;
-		rqueue_size[tid]--;
 		t->calls++;
 		curr_task = (struct task *)t;
 		if (likely(process == process_stream))
@@ -387,7 +406,7 @@ void process_runnable_tasks()
 
 		max_processed--;
 		if (max_processed <= 0) {
-			active_tasks_mask |= tid_bit;
+			HA_ATOMIC_OR(&active_tasks_mask, tid_bit);
 			activity[tid].long_rq++;
 			break;
 		}

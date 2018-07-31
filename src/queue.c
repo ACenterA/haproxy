@@ -10,6 +10,65 @@
  *
  */
 
+/* Short explanation on the locking, which is far from being trivial : a
+ * pendconn is a list element which necessarily is associated with an existing
+ * stream. It has pendconn->strm always valid. A pendconn may only be in one of
+ * these three states :
+ *   - unlinked : in this case it is an empty list head ;
+ *   - linked into the server's queue ;
+ *   - linked into the proxy's queue.
+ *
+ * A stream does not necessarily have such a pendconn. Thus the pendconn is
+ * designated by the stream->pend_pos pointer. This results in some properties :
+ *   - pendconn->strm->pend_pos is never NULL for any valid pendconn
+ *   - if LIST_ISEMPTY(pendconn->list) is true, the element is unlinked,
+ *     otherwise it necessarily belongs to one of the other lists ; this may
+ *     not be atomically checked under threads though ;
+ *   - pendconn->px is never NULL if pendconn->list is not empty
+ *   - pendconn->srv is never NULL if pendconn->list is in the server's queue,
+ *     and is always NULL if pendconn->list is in the backend's queue or empty.
+ *   - pendconn->target is NULL while the element is queued, and points to the
+ *     assigned server when the pendconn is picked.
+ *
+ * Threads complicate the design a little bit but rules remain simple :
+ *   - the server's queue lock must be held at least when manipulating the
+ *     server's queue, which is when adding a pendconn to the queue and when
+ *     removing a pendconn from the queue. It protects the queue's integrity.
+ *
+ *   - the proxy's queue lock must be held at least when manipulating the
+ *     proxy's queue, which is when adding a pendconn to the queue and when
+ *     removing a pendconn from the queue. It protects the queue's integrity.
+ *
+ *   - both locks are compatible and may be held at the same time.
+ *
+ *   - a pendconn_add() is only performed by the stream which will own the
+ *     pendconn ; the pendconn is allocated at this moment and returned ; it is
+ *     added to either the server or the proxy's queue while holding this
+ *     queue's lock.
+ *
+ *   - the pendconn is then met by a thread walking over the proxy or server's
+ *     queue with the respective lock held. This lock is exclusive and the
+ *     pendconn can only appear in one queue so by definition a single thread
+ *     may find this pendconn at a time.
+ *
+ *   - the pendconn is unlinked either by its own stream upon success/abort/
+ *     free, or by another one offering it its server slot. This is achieved by
+ *     pendconn_process_next_strm() under either the server or proxy's lock,
+ *     pendconn_redistribute() under the server's lock, pendconn_grab_from_px()
+ *     under the proxy's lock, or pendconn_unlink() under either the proxy's or
+ *     the server's lock depending on the queue the pendconn is attached to.
+ *
+ *   - no single operation except the pendconn initialisation prior to the
+ *     insertion are performed without eithre a queue lock held or the element
+ *     being unlinked and visible exclusively to its stream.
+ *
+ *   - pendconn_grab_from_px() and pendconn_process_next_strm() assign ->target
+ *     so that the stream knows what server to work with (via
+ *     pendconn_dequeue() which sets it on strm->target).
+ *
+ *   - a pendconn doesn't switch between queues, it stays where it is.
+ */
+
 #include <common/config.h>
 #include <common/memory.h>
 #include <common/time.h>
@@ -63,13 +122,12 @@ unsigned int srv_dynamic_maxconn(const struct server *s)
 
 /* Remove the pendconn from the server/proxy queue. At this stage, the
  * connection is not really dequeued. It will be done during the
- * process_stream. This function must be called by function owning the locks on
- * the pendconn _AND_ the server/proxy. It also decreases the pending count.
+ * process_stream. It also decreases the pending count.
  *
- * The caller must own the lock on the pendconn _AND_ the queue containing the
- * pendconn. The pendconn must still be queued.
+ * The caller must own the lock on the queue containing the pendconn. The
+ * pendconn must still be queued.
  */
-static void pendconn_unlink(struct pendconn *p)
+static void __pendconn_unlink(struct pendconn *p)
 {
 	if (p->srv)
 		p->srv->nbpend--;
@@ -78,6 +136,46 @@ static void pendconn_unlink(struct pendconn *p)
 	HA_ATOMIC_SUB(&p->px->totpend, 1);
 	LIST_DEL(&p->list);
 	LIST_INIT(&p->list);
+}
+
+/* Locks the queue the pendconn element belongs to. This relies on both p->px
+ * and p->srv to be properly initialized (which is always the case once the
+ * element has been added).
+ */
+static inline void pendconn_queue_lock(struct pendconn *p)
+{
+	if (p->srv)
+		HA_SPIN_LOCK(SERVER_LOCK, &p->srv->lock);
+	else
+		HA_SPIN_LOCK(PROXY_LOCK, &p->px->lock);
+}
+
+/* Unlocks the queue the pendconn element belongs to. This relies on both p->px
+ * and p->srv to be properly initialized (which is always the case once the
+ * element has been added).
+ */
+static inline void pendconn_queue_unlock(struct pendconn *p)
+{
+	if (p->srv)
+		HA_SPIN_UNLOCK(SERVER_LOCK, &p->srv->lock);
+	else
+		HA_SPIN_UNLOCK(PROXY_LOCK, &p->px->lock);
+}
+
+/* Removes the pendconn from the server/proxy queue. At this stage, the
+ * connection is not really dequeued. It will be done during process_stream().
+ * This function takes all the required locks for the operation. The caller is
+ * responsible for ensuring that <p> is valid and still in the queue. Use
+ * pendconn_cond_unlink() if unsure. When the locks are already held, please
+ * use __pendconn_unlink() instead.
+ */
+void pendconn_unlink(struct pendconn *p)
+{
+	pendconn_queue_lock(p);
+
+	__pendconn_unlink(p);
+
+	pendconn_queue_unlock(p);
 }
 
 /* Process the next pending connection from either a server or a proxy, and
@@ -102,49 +200,38 @@ static int pendconn_process_next_strm(struct server *srv, struct proxy *px)
 {
 	struct pendconn *p = NULL;
 	struct server   *rsrv;
-	int remote;
 
 	rsrv = srv->track;
 	if (!rsrv)
 		rsrv = srv;
 
-	if (srv->nbpend) {
-		list_for_each_entry(p, &srv->pendconns, list) {
-			if (!HA_SPIN_TRYLOCK(PENDCONN_LOCK, &p->lock))
-				goto ps_found;
-		}
-		p = NULL;
-	}
+	p = NULL;
+	if (srv->nbpend)
+		p = LIST_ELEM(srv->pendconns.n, struct pendconn *, list);
 
-  ps_found:
 	if (srv_currently_usable(rsrv) && px->nbpend) {
 		struct pendconn *pp;
 
-		list_for_each_entry(pp, &px->pendconns, list) {
-			/* If the server pendconn is older than the proxy one,
-			 * we process the server one. */
-			if (p && !tv_islt(&pp->strm->logs.tv_request, &p->strm->logs.tv_request))
-				goto pendconn_found;
+		pp = LIST_ELEM(px->pendconns.n, struct pendconn *, list);
 
-			if (!HA_SPIN_TRYLOCK(PENDCONN_LOCK, &pp->lock)) {
-				/* Let's switch from the server pendconn to the
-				 * proxy pendconn. Don't forget to unlock the
-				 * server pendconn, if any. */
-				if (p)
-					HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
-				p = pp;
-				goto pendconn_found;
-			}
-		}
+		/* If the server pendconn is older than the proxy one,
+		 * we process the server one.
+		 */
+		if (p && !tv_islt(&pp->strm->logs.tv_request, &p->strm->logs.tv_request))
+			goto pendconn_found;
+
+		/* Let's switch from the server pendconn to the proxy pendconn */
+		p = pp;
+		goto pendconn_found;
 	}
 
 	if (!p)
 		return 0;
 
   pendconn_found:
-	pendconn_unlink(p);
+	__pendconn_unlink(p);
 	p->strm_flags |= SF_ASSIGNED;
-	p->srv = srv;
+	p->target = srv;
 
 	HA_ATOMIC_ADD(&srv->served, 1);
 	HA_ATOMIC_ADD(&srv->proxy->served, 1);
@@ -152,12 +239,9 @@ static int pendconn_process_next_strm(struct server *srv, struct proxy *px)
 		px->lbprm.server_take_conn(srv);
 	__stream_add_srv_conn(p->strm, srv);
 
-	remote = !(p->strm->task->thread_mask & tid_bit);
 	task_wakeup(p->strm->task, TASK_WOKEN_RES);
-	HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
 
-	/* Returns 1 if the current thread can process the stream, otherwise returns 2. */
-	return remote ? 2 : 1;
+	return 1;
 }
 
 /* Manages a server's connection queue. This function will try to dequeue as
@@ -166,7 +250,7 @@ static int pendconn_process_next_strm(struct server *srv, struct proxy *px)
 void process_srv_queue(struct server *s)
 {
 	struct proxy  *p = s->proxy;
-	int maxconn, remote = 0;
+	int maxconn;
 
 	HA_SPIN_LOCK(PROXY_LOCK,  &p->lock);
 	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
@@ -175,13 +259,9 @@ void process_srv_queue(struct server *s)
 		int ret = pendconn_process_next_strm(s, p);
 		if (!ret)
 			break;
-		remote |= (ret == 2);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 	HA_SPIN_UNLOCK(PROXY_LOCK,  &p->lock);
-
-	if (remote)
-		THREAD_WANT_SYNC();
 }
 
 /* Adds the stream <strm> to the pending connection list of server <strm>->srv
@@ -203,36 +283,39 @@ struct pendconn *pendconn_add(struct stream *strm)
 	if (!p)
 		return NULL;
 
-	srv = objt_server(strm->target);
-	px  = strm->be;
+	if (strm->flags & SF_ASSIGNED)
+		srv = objt_server(strm->target);
+	else
+		srv = NULL;
 
-	p->srv        = NULL;
+	px            = strm->be;
+	p->target     = NULL;
+	p->srv        = srv;
 	p->px         = px;
 	p->strm       = strm;
 	p->strm_flags = strm->flags;
-	HA_SPIN_INIT(&p->lock);
 
-	if ((strm->flags & SF_ASSIGNED) && srv) {
-		p->srv = srv;
-		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
+	pendconn_queue_lock(p);
+
+	if (srv) {
 		srv->nbpend++;
 		strm->logs.srv_queue_size += srv->nbpend;
 		if (srv->nbpend > srv->counters.nbpend_max)
 			srv->counters.nbpend_max = srv->nbpend;
 		LIST_ADDQ(&srv->pendconns, &p->list);
-		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
 	else {
-		HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
 		px->nbpend++;
 		strm->logs.prx_queue_size += px->nbpend;
 		if (px->nbpend > px->be_counters.nbpend_max)
 			px->be_counters.nbpend_max = px->nbpend;
 		LIST_ADDQ(&px->pendconns, &p->list);
-		HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
 	}
-	HA_ATOMIC_ADD(&px->totpend, 1);
 	strm->pend_pos = p;
+
+	pendconn_queue_unlock(p);
+
+	HA_ATOMIC_ADD(&px->totpend, 1);
 	return p;
 }
 
@@ -243,7 +326,6 @@ int pendconn_redistribute(struct server *s)
 {
 	struct pendconn *p, *pback;
 	int xferred = 0;
-	int remote = 0;
 
 	/* The REDISP option was specified. We will ignore cookie and force to
 	 * balance or use the dispatcher. */
@@ -255,21 +337,13 @@ int pendconn_redistribute(struct server *s)
 		if (p->strm_flags & SF_FORCE_PRST)
 			continue;
 
-		if (HA_SPIN_TRYLOCK(PENDCONN_LOCK, &p->lock))
-			continue;
-
 		/* it's left to the dispatcher to choose a server */
-		pendconn_unlink(p);
+		__pendconn_unlink(p);
 		p->strm_flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
 
-		remote |= !(p->strm->task->thread_mask & tid_bit);
 		task_wakeup(p->strm->task, TASK_WOKEN_RES);
-		HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
-
-	if (remote)
-		THREAD_WANT_SYNC();
 	return xferred;
 }
 
@@ -282,7 +356,6 @@ int pendconn_grab_from_px(struct server *s)
 {
 	struct pendconn *p, *pback;
 	int maxconn, xferred = 0;
-	int remote = 0;
 
 	if (!srv_currently_usable(s))
 		return 0;
@@ -293,21 +366,13 @@ int pendconn_grab_from_px(struct server *s)
 		if (s->maxconn && s->served + xferred >= maxconn)
 			break;
 
-		if (HA_SPIN_TRYLOCK(PENDCONN_LOCK, &p->lock))
-			continue;
+		__pendconn_unlink(p);
+		p->target = s;
 
-		pendconn_unlink(p);
-		p->srv = s;
-
-		remote |= !(p->strm->task->thread_mask & tid_bit);
 		task_wakeup(p->strm->task, TASK_WOKEN_RES);
-		HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
 		xferred++;
 	}
 	HA_SPIN_UNLOCK(PROXY_LOCK, &s->proxy->lock);
-
-	if (remote)
-		THREAD_WANT_SYNC();
 	return xferred;
 }
 
@@ -323,6 +388,7 @@ int pendconn_grab_from_px(struct server *s)
 int pendconn_dequeue(struct stream *strm)
 {
 	struct pendconn *p;
+	int is_unlinked;
 
 	if (unlikely(!strm->pend_pos)) {
 		/* unexpected case because it is called by the stream itself and
@@ -333,63 +399,31 @@ int pendconn_dequeue(struct stream *strm)
 		abort();
 	}
 	p = strm->pend_pos;
-	HA_SPIN_LOCK(PENDCONN_LOCK, &p->lock);
 
-	/* the pendconn is still linked to the server/proxy queue, so unlock it
-	 * and go away. */
-	if (!LIST_ISEMPTY(&p->list)) {
-		HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
+	/* note below : we need to grab the queue's lock to check for emptiness
+	 * because we don't want a partial _grab_from_px() or _redistribute()
+	 * to be called in parallel and show an empty list without having the
+	 * time to finish. With this we know that if we see the element
+	 * unlinked, these functions were completely done.
+	 */
+	pendconn_queue_lock(p);
+	is_unlinked = LIST_ISEMPTY(&p->list);
+	pendconn_queue_unlock(p);
+
+	if (!is_unlinked)
 		return 1;
-	}
 
-	/* the pendconn must be dequeued now */
-	if (p->srv)
-		strm->target = &p->srv->obj_type;
+	/* the pendconn is not queued anymore and will not be so we're safe
+	 * to proceed.
+	 */
+	if (p->target)
+		strm->target = &p->target->obj_type;
 
 	strm->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
 	strm->flags |= p->strm_flags & (SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
 	strm->pend_pos = NULL;
-	HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
 	pool_free(pool_head_pendconn, p);
 	return 0;
-}
-
-/* Release the pending connection <p>, and decreases the pending count if
- * needed. The connection might have been queued to a specific server as well as
- * to the proxy. The stream also gets marked unqueued. <p> must always be
- * defined here. So it is the caller responsibility to check its existance.
- *
- * This function must be called by the stream itself, so in the context of
- * process_stream.
- */
-void pendconn_free(struct pendconn *p)
-{
-	struct stream *strm = p->strm;
-
-	HA_SPIN_LOCK(PENDCONN_LOCK, &p->lock);
-
-	/* The pendconn was already unlinked, just release it. */
-	if (LIST_ISEMPTY(&p->list))
-		goto release;
-
-	if (p->srv) {
-		HA_SPIN_LOCK(SERVER_LOCK, &p->srv->lock);
-		p->srv->nbpend--;
-		LIST_DEL(&p->list);
-		HA_SPIN_UNLOCK(SERVER_LOCK, &p->srv->lock);
-	}
-	else {
-		HA_SPIN_LOCK(PROXY_LOCK, &p->px->lock);
-		p->px->nbpend--;
-		LIST_DEL(&p->list);
-		HA_SPIN_UNLOCK(PROXY_LOCK, &p->px->lock);
-	}
-	HA_ATOMIC_SUB(&p->px->totpend, 1);
-
-  release:
-	strm->pend_pos = NULL;
-	HA_SPIN_UNLOCK(PENDCONN_LOCK, &p->lock);
-	pool_free(pool_head_pendconn, p);
 }
 
 /*
