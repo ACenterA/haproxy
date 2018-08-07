@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2017 Willy Tarreau <willy@haproxy.org>.
+ * Copyright 2000-2018 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -354,7 +354,7 @@ void hap_register_per_thread_deinit(void (*fct)())
 static void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2017 Willy Tarreau <willy@haproxy.org>\n\n");
+	printf("Copyright 2000-2018 Willy Tarreau <willy@haproxy.org>\n\n");
 }
 
 static void display_build_opts()
@@ -2459,8 +2459,7 @@ static void *run_thread_poll_loop(void *data)
 	struct per_thread_deinit_fct *ptdf;
 	__decl_hathreads(static HA_SPINLOCK_T start_lock);
 
-	tid     = *((unsigned int *)data);
-	tid_bit = (1UL << tid);
+	ha_set_tid(*((unsigned int *)data));
 	tv_update_date(-1,-1);
 
 	list_for_each_entry(ptif, &per_thread_init_list, list) {
