@@ -159,9 +159,13 @@ static size_t mux_pt_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t 
 }
 
 /* Called from the upper layer, to send data */
-static size_t mux_pt_snd_buf(struct conn_stream *cs, const struct buffer *buf, size_t count, int flags)
+static size_t mux_pt_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
-	return cs->conn->xprt->snd_buf(cs->conn, buf, count, flags);
+	size_t ret = cs->conn->xprt->snd_buf(cs->conn, buf, count, flags);
+
+	if (ret > 0)
+		b_del(buf, ret);
+	return ret;
 }
 
 /* Called from the upper layer, to subscribe to events */
@@ -211,12 +215,12 @@ const struct mux_ops mux_pt_ops = {
 	.name = "PASS",
 };
 
-/* ALPN selection : default mux has empty name */
-static struct alpn_mux_list alpn_mux_pt =
-	{ .token = IST(""), .mode = ALPN_MODE_ANY, .mux = &mux_pt_ops };
+/* PROT selection : default mux has empty name */
+static struct mux_proto_list mux_proto_pt =
+	{ .token = IST(""), .mode = PROTO_MODE_ANY, .side = PROTO_SIDE_BOTH, .mux = &mux_pt_ops };
 
 __attribute__((constructor))
 static void __mux_pt_init(void)
 {
-	alpn_register_mux(&alpn_mux_pt);
+	register_mux_proto(&mux_proto_pt);
 }

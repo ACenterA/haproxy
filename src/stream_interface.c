@@ -721,7 +721,7 @@ static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state)
 		if (oc->flags & CF_STREAMER)
 			send_flag |= CO_SFL_STREAMER;
 
-		ret = conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
+		ret = cs_send(cs, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
 			oc->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA | CF_WRITE_EVENT;
@@ -1235,7 +1235,7 @@ static void si_cs_recv_cb(struct conn_stream *cs)
 	 * that if such an event is not handled above in splice, it will be handled here by
 	 * recv().
 	 */
-	while (!(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE)) &&
+	while (!(conn->flags & (CO_FL_ERROR | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE)) &&
 	       !(cs->flags & (CS_FL_ERROR|CS_FL_EOS)) && !(ic->flags & CF_SHUTR)) {
 		max = channel_recv_max(ic);
 

@@ -311,7 +311,7 @@ struct mux_ops {
 	int  (*wake)(struct connection *conn);        /* mux-layer callback to report activity, mandatory */
 	void (*update_poll)(struct conn_stream *cs);  /* commit cs flags to mux/conn */
 	size_t (*rcv_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to get data */
-	size_t (*snd_buf)(struct conn_stream *cs, const struct buffer *buf, size_t count, int flags); /* Called from the upper layer to send data */
+	size_t (*snd_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to send data */
 	int  (*rcv_pipe)(struct conn_stream *cs, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
 	int  (*snd_pipe)(struct conn_stream *cs, struct pipe *pipe); /* send-to-pipe callback */
 	void (*shutr)(struct conn_stream *cs, enum cs_shr_mode);     /* shutr function */
@@ -373,6 +373,7 @@ struct conn_stream {
 	struct wait_list wait_list;          /* We're in a wait list for send */
 	struct list send_wait_list;          /* list of tasks to wake when we're ready to send */
 	struct buffer rxbuf;                 /* receive buffer, always valid (buf_empty or real buffer) */
+	struct buffer txbuf;                 /* transmission buffer, always valid (buf_empty or real buffer) */
 	void *data;                          /* pointer to upper layer's entity (eg: stream interface) */
 	const struct data_cb *data_cb;       /* data layer callbacks. Must be set before xprt->init() */
 	void *ctx;                           /* mux-specific context */
@@ -420,17 +421,25 @@ struct connection {
 	} addr; /* addresses of the remote side, client for producer and server for consumer */
 };
 
-/* ALPN token registration */
-enum alpn_proxy_mode {
-	ALPN_MODE_NONE = 0,
-	ALPN_MODE_TCP  = 1 << 0, // must not be changed!
-	ALPN_MODE_HTTP = 1 << 1, // must not be changed!
-	ALPN_MODE_ANY  = ALPN_MODE_TCP | ALPN_MODE_HTTP,
+/* PROTO token registration */
+enum proto_proxy_mode {
+	PROTO_MODE_NONE = 0,
+	PROTO_MODE_TCP  = 1 << 0, // must not be changed!
+	PROTO_MODE_HTTP = 1 << 1, // must not be changed!
+	PROTO_MODE_ANY  = PROTO_MODE_TCP | PROTO_MODE_HTTP,
 };
 
-struct alpn_mux_list {
+enum proto_proxy_side {
+	PROTO_SIDE_NONE = 0,
+	PROTO_SIDE_FE   = 1, // same as PR_CAP_FE
+	PROTO_SIDE_BE   = 2, // same as PR_CAP_BE
+	PROTO_SIDE_BOTH = PROTO_SIDE_FE | PROTO_SIDE_BE,
+};
+
+struct mux_proto_list {
 	const struct ist token;    /* token name and length. Empty is catch-all */
-	enum alpn_proxy_mode mode;
+	enum proto_proxy_mode mode;
+	enum proto_proxy_side side;
 	const struct mux_ops *mux;
 	struct list list;
 };

@@ -32,6 +32,7 @@
 #include <proto/applet.h>
 #include <proto/cli.h>
 #include <proto/checks.h>
+#include <proto/connection.h>
 #include <proto/port_range.h>
 #include <proto/protocol.h>
 #include <proto/queue.h>
@@ -44,10 +45,7 @@
 #include <proto/dns.h>
 #include <netinet/tcp.h>
 
-struct list updated_servers = LIST_HEAD_INIT(updated_servers);
-__decl_hathreads(HA_SPINLOCK_T updated_servers_lock);
-
-static void srv_register_update(struct server *srv);
+static void srv_update_status(struct server *s);
 static void srv_update_state(struct server *srv, int version, char **params);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
 static int srv_set_fqdn(struct server *srv, const char *fqdn, int dns_locked);
@@ -502,6 +500,29 @@ static int inline srv_enable_pp_flags(struct server *srv, unsigned int flags)
 	srv->pp_opts |= flags;
 	return 0;
 }
+/* parse the "proto" server keyword */
+static int srv_parse_proto(char **args, int *cur_arg,
+			   struct proxy *px, struct server *newsrv, char **err)
+{
+	struct ist proto;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' : missing value", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	proto = ist2(args[*cur_arg + 1], strlen(args[*cur_arg + 1]));
+	newsrv->mux_proto = get_mux_proto(proto);
+	if (!newsrv->mux_proto) {
+		memprintf(err, "'%s' :  unknown MUX protocol '%s'", args[*cur_arg], args[*cur_arg+1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (!(newsrv->mux_proto->side & PROTO_SIDE_BE)) {
+		memprintf(err, "'%s' :  MUX protocol '%s' cannot be used for outgoing connections",
+			  args[*cur_arg], args[*cur_arg+1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+}
 
 /* parse the "proxy-v2-options" */
 static int srv_parse_proxy_v2_options(char **args, int *cur_arg,
@@ -929,12 +950,16 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
-	srv_register_update(s);
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopped(srv, NULL, NULL);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
+
+	/* propagate changes */
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Marks server <s> up regardless of its checks' statuses and provided it isn't
@@ -970,12 +995,16 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 	if (s->slowstart <= 0)
 		s->next_state = SRV_ST_RUNNING;
 
-	srv_register_update(s);
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_running(srv, NULL, NULL);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
+
+	/* propagate changes */
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Marks server <s> stopping regardless of its checks' statuses and provided it
@@ -1010,12 +1039,16 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
-	srv_register_update(s);
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopping(srv, NULL, NULL);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
+
+	/* propagate changes */
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Enables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
@@ -1041,12 +1074,10 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 	if (cause)
 		strlcpy2(s->adm_st_chg_cause, cause, sizeof(s->adm_st_chg_cause));
 
-	srv_register_update(s);
-
 	/* stop going down if the equivalent flag was already present (forced or inherited) */
 	if (((mode & SRV_ADMF_MAINT) && (s->next_admin & ~mode & SRV_ADMF_MAINT)) ||
 	    ((mode & SRV_ADMF_DRAIN) && (s->next_admin & ~mode & SRV_ADMF_DRAIN)))
-		return;
+		goto end;
 
 	/* compute the inherited flag to propagate */
 	if (mode & SRV_ADMF_MAINT)
@@ -1059,6 +1090,12 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 		srv_set_admin_flag(srv, mode, cause);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
+
+ end:
+	/* propagate changes */
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Disables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
@@ -1080,12 +1117,10 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 
 	s->next_admin &= ~mode;
 
-	srv_register_update(s);
-
 	/* stop going down if the equivalent flag is still present (forced or inherited) */
 	if (((mode & SRV_ADMF_MAINT) && (s->next_admin & SRV_ADMF_MAINT)) ||
 	    ((mode & SRV_ADMF_DRAIN) && (s->next_admin & SRV_ADMF_DRAIN)))
-		return;
+		goto end;
 
 	if (mode & SRV_ADMF_MAINT)
 		mode = SRV_ADMF_IMAINT;
@@ -1097,6 +1132,12 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 		srv_clr_admin_flag(srv, mode);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
+
+ end:
+	/* propagate changes */
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* principle: propagate maint and drain to tracking servers. This is useful
@@ -1162,6 +1203,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "no-send-proxy-v2",    srv_parse_no_send_proxy_v2,    0,  1 }, /* Disable use of PROXY V2 protocol */
 	{ "non-stick",           srv_parse_non_stick,           0,  1 }, /* Disable stick-table persistence */
 	{ "observe",             srv_parse_observe,             1,  1 }, /* Enables health adjusting based on observing communication with the server */
+	{ "proto",               srv_parse_proto,               1,  1 }, /* Set the proto to use for all outgoing connections */
 	{ "proxy-v2-options",    srv_parse_proxy_v2_options,    1,  1 }, /* options for send-proxy-v2 */
 	{ "redir",               srv_parse_redir,               1,  1 }, /* Enable redirection mode */
 	{ "send-proxy",          srv_parse_send_proxy,          0,  1 }, /* Enforce use of PROXY V1 protocol */
@@ -1180,9 +1222,10 @@ static void __listener_init(void)
 
 /* Recomputes the server's eweight based on its state, uweight, the current time,
  * and the proxy's algorihtm. To be used after updating sv->uweight. The warmup
- * state is automatically disabled if the time is elapsed.
+ * state is automatically disabled if the time is elapsed. If <must_update> is
+ * not zero, the update will be propagated immediately.
  */
-void server_recalc_eweight(struct server *sv)
+void server_recalc_eweight(struct server *sv, int must_update)
 {
 	struct proxy *px = sv->proxy;
 	unsigned w;
@@ -1203,7 +1246,12 @@ void server_recalc_eweight(struct server *sv)
 
 	sv->next_eweight = (sv->uweight * w + px->lbprm.wmult - 1) / px->lbprm.wmult;
 
-	srv_register_update(sv);
+	/* propagate changes only if needed (i.e. not recursively) */
+	if (must_update) {
+		thread_isolate();
+		srv_update_status(sv);
+		thread_release();
+	}
 }
 
 /*
@@ -1247,7 +1295,7 @@ const char *server_parse_weight_change_request(struct server *sv,
 		return "Backend is using a static LB algorithm and only accepts weights '0%' and '100%'.\n";
 
 	sv->uweight = w;
-	server_recalc_eweight(sv);
+	server_recalc_eweight(sv, 1);
 
 	return NULL;
 }
@@ -1561,6 +1609,8 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 #ifdef TCP_USER_TIMEOUT
 	srv->tcp_ut = src->tcp_ut;
 #endif
+	srv->mux_proto = src->mux_proto;
+
 	if (srv_tmpl)
 		srv->srvrq = src->srvrq;
 }
@@ -1591,8 +1641,6 @@ static struct server *new_server(struct proxy *proxy)
 		LIST_INIT(&srv->idle_conns[i]);
 		LIST_INIT(&srv->safe_conns[i]);
 	}
-
-	LIST_INIT(&srv->update_status);
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
 	srv->last_change = now.tv_sec;
@@ -2672,18 +2720,6 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
 	return NULL;
 }
 
-/* Registers changes to be applied asynchronously */
-static void srv_register_update(struct server *srv)
-{
-	if (LIST_ISEMPTY(&srv->update_status)) {
-		THREAD_WANT_SYNC();
-		HA_SPIN_LOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
-		if (LIST_ISEMPTY(&srv->update_status))
-			LIST_ADDQ(&updated_servers, &srv->update_status);
-		HA_SPIN_UNLOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
-	}
-}
-
 /* Update a server state using the parameters available in the params list */
 static void srv_update_state(struct server *srv, int version, char **params)
 {
@@ -2972,7 +3008,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			if (srv_iweight == srv->iweight) {
 				srv->uweight = srv_uweight;
 			}
-			server_recalc_eweight(srv);
+			server_recalc_eweight(srv, 1);
 
 			/* load server IP address */
 			if (strcmp(params[0], "-")) {
@@ -4563,7 +4599,6 @@ static struct cli_kw_list cli_kws = {{ },{
 __attribute__((constructor))
 static void __server_init(void)
 {
-	HA_SPIN_INIT(&updated_servers_lock);
 	cli_register_kw(&cli_kws);
 }
 
@@ -4572,7 +4607,7 @@ static void __server_init(void)
  * is designed to be called asynchronously.
  *
  */
-void srv_update_status(struct server *s)
+static void srv_update_status(struct server *s)
 {
 	struct check *check = &s->check;
 	int xferred;
@@ -4581,7 +4616,6 @@ void srv_update_status(struct server *s)
 	int srv_was_stopping = (s->cur_state == SRV_ST_STOPPING) || (s->cur_admin & SRV_ADMF_DRAIN);
 	int log_level;
 	struct buffer *tmptrash = NULL;
-
 
 	/* If currently main is not set we try to apply pending state changes */
 	if (!(s->cur_admin & SRV_ADMF_MAINT)) {
@@ -4674,7 +4708,7 @@ void srv_update_status(struct server *s)
 			if (s->next_state == SRV_ST_STARTING)
 				task_schedule(s->warmup, tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20))));
 
-			server_recalc_eweight(s);
+			server_recalc_eweight(s, 0);
 			/* now propagate the status change to any LB algorithms */
 			if (px->lbprm.update_server_eweight)
 				px->lbprm.update_server_eweight(s);
@@ -4888,7 +4922,7 @@ void srv_update_status(struct server *s)
 			tmptrash = NULL;
 		}
 
-		server_recalc_eweight(s);
+		server_recalc_eweight(s, 0);
 		/* now propagate the status change to any LB algorithms */
 		if (px->lbprm.update_server_eweight)
 			px->lbprm.update_server_eweight(s);
@@ -4904,6 +4938,19 @@ void srv_update_status(struct server *s)
 		if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
 			set_backend_down(s->proxy);
 
+		/* If the server is set with "on-marked-up shutdown-backup-sessions",
+		 * and it's not a backup server and its effective weight is > 0,
+		 * then it can accept new connections, so we shut down all streams
+		 * on all backup servers.
+		 */
+		if ((s->onmarkedup & HANA_ONMARKEDUP_SHUTDOWNBACKUPSESSIONS) &&
+		    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
+			srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
+
+		/* check if we can handle some connections queued at the proxy. We
+		 * will take as many as we can handle.
+		 */
+		xferred = pendconn_grab_from_px(s);
 	}
 	else if (s->next_admin & SRV_ADMF_MAINT) {
 		/* remaining in maintenance mode, let's inform precisely about the
@@ -5011,7 +5058,7 @@ void srv_update_status(struct server *s)
 			if (s->last_change < now.tv_sec)                        // ignore negative times
 				s->down_time += now.tv_sec - s->last_change;
 			s->last_change = now.tv_sec;
-			server_recalc_eweight(s);
+			server_recalc_eweight(s, 0);
 
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
@@ -5088,22 +5135,6 @@ void srv_update_status(struct server *s)
 
 	/* Re-set log strings to empty */
 	*s->adm_st_chg_cause = 0;
-}
-/*
- * This function loops on servers registered for asynchronous
- * status changes
- *
- * NOTE: No needs to lock <updated_servers> list because it is called inside the
- * sync point.
- */
-void servers_update_status(void) {
-	struct server *s, *stmp;
-
-	list_for_each_entry_safe(s, stmp, &updated_servers, update_status) {
-		srv_update_status(s);
-		LIST_DEL(&s->update_status);
-		LIST_INIT(&s->update_status);
-	}
 }
 
 /*

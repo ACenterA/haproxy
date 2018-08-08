@@ -3415,7 +3415,7 @@ static int h2_subscribe(struct conn_stream *cs, int event_type, void *param)
 }
 
 /* Called from the upper layer, to send data */
-static size_t h2_snd_buf(struct conn_stream *cs, const struct buffer *buf, size_t count, int flags)
+static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
 	struct h2s *h2s = cs->ctx;
 	size_t total = 0;
@@ -3486,6 +3486,7 @@ static size_t h2_snd_buf(struct conn_stream *cs, const struct buffer *buf, size_
 			LIST_ADDQ(&h2s->h2c->fctl_list, &h2s->list);
 	}
 
+	b_del(buf, total);
 	return total;
 }
 
@@ -3600,9 +3601,9 @@ const struct mux_ops h2_ops = {
 	.name = "H2",
 };
 
-/* ALPN selection : this mux registers ALPN tolen "h2" */
-static struct alpn_mux_list alpn_mux_h2 =
-	{ .token = IST("h2"), .mode = ALPN_MODE_HTTP, .mux = &h2_ops };
+/* PROTO selection : this mux registers PROTO token "h2" */
+static struct mux_proto_list mux_proto_h2 =
+	{ .token = IST("h2"), .mode = PROTO_MODE_HTTP, .side = PROTO_SIDE_FE, .mux = &h2_ops };
 
 /* config keyword parsers */
 static struct cfg_kw_list cfg_kws = {ILH, {
@@ -3621,7 +3622,7 @@ static void __h2_deinit(void)
 __attribute__((constructor))
 static void __h2_init(void)
 {
-	alpn_register_mux(&alpn_mux_h2);
+	register_mux_proto(&mux_proto_h2);
 	cfg_register_keywords(&cfg_kws);
 	hap_register_post_deinit(__h2_deinit);
 	pool_head_h2c = create_pool("h2c", sizeof(struct h2c), MEM_F_SHARED);

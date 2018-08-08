@@ -1123,7 +1123,7 @@ int connect_server(struct stream *s)
 			 */
 			srv_cs = srv_conn->mux_ctx;
 
-			if (srv_conn->mux == &mux_pt_ops && srv_cs->data) {
+			if (srv_cs->data) {
 				si_detach_endpoint(srv_cs->data);
 				if (old_cs && !(old_cs->conn->flags & CO_FL_PRIVATE)) {
 					si_attach_cs(srv_cs->data, old_cs);
@@ -1178,21 +1178,18 @@ int connect_server(struct stream *s)
 		srv_conn->target = s->target;
 
 		/* set the correct protocol on the output stream interface */
-		if (srv) {
+		if (srv)
 			conn_prepare(srv_conn, protocol_by_family(srv_conn->addr.to.ss_family), srv->xprt);
-			/* XXX: Pick the right mux, when we finally have one */
-			conn_install_mux(srv_conn, &mux_pt_ops, srv_cs);
-		}
 		else if (obj_type(s->target) == OBJ_TYPE_PROXY) {
 			/* proxies exclusively run on raw_sock right now */
 			conn_prepare(srv_conn, protocol_by_family(srv_conn->addr.to.ss_family), xprt_get(XPRT_RAW));
 			if (!objt_cs(s->si[1].end) || !objt_cs(s->si[1].end)->conn->ctrl)
 				return SF_ERR_INTERNAL;
-			/* XXX: Pick the right mux, when we finally have one */
-			conn_install_mux(srv_conn, &mux_pt_ops, srv_cs);
 		}
 		else
 			return SF_ERR_INTERNAL;  /* how did we get there ? */
+
+		conn_install_mux_be(srv_conn, srv_cs);
 
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;

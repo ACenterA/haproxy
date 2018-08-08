@@ -34,7 +34,7 @@
 extern struct pool_head *pool_head_connection;
 extern struct pool_head *pool_head_connstream;
 extern struct xprt_ops *registered_xprt[XPRT_ENTRIES];
-extern struct alpn_mux_list alpn_mux_list;
+extern struct mux_proto_list mux_proto_list;
 
 /* perform minimal intializations, report 0 in case of error, 1 if OK. */
 int init_connection();
@@ -46,6 +46,7 @@ void conn_fd_handler(int fd);
 
 /* conn_stream functions */
 size_t __cs_recv(struct conn_stream *cs, struct buffer *buf, size_t count, int flags);
+size_t __cs_send(struct conn_stream *cs, struct buffer *buf, size_t count, int flags);
 
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
@@ -312,6 +313,17 @@ static inline size_t cs_recv(struct conn_stream *cs, struct buffer *buf, size_t 
 		return cs->conn->mux->rcv_buf(cs, buf, count, flags);
 	else
 		return __cs_recv(cs, buf, count, flags);
+}
+
+/* conn_stream send function. Uses mux->snd_buf() if defined, otherwise
+ * falls back to __cs_send().
+ */
+static inline size_t cs_send(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
+{
+	if (cs->conn->mux->snd_buf)
+		return cs->conn->mux->snd_buf(cs, buf, count, flags);
+	else
+		return __cs_send(cs, buf, count, flags);
 }
 
 /***** Event manipulation primitives for use by DATA I/O callbacks *****/
@@ -616,6 +628,7 @@ static inline void cs_init(struct conn_stream *cs, struct connection *conn)
 	LIST_INIT(&cs->send_wait_list);
 	cs->conn = conn;
 	cs->rxbuf = BUF_NULL;
+	cs->txbuf = BUF_NULL;
 }
 
 /* Initializes all required fields for a new connection. Note that it does the
@@ -687,6 +700,17 @@ static inline void cs_drop_rxbuf(struct conn_stream *cs)
 	}
 }
 
+/* Releases the conn_stream's tx buf if it exists. The buffer is automatically
+ * replaced with a pointer to the empty buffer.
+ */
+static inline void cs_drop_txbuf(struct conn_stream *cs)
+{
+	if (b_size(&cs->txbuf)) {
+		b_free(&cs->txbuf);
+		offer_buffers(NULL, tasks_run_queue);
+	}
+}
+
 /* Releases a conn_stream previously allocated by cs_new(), as well as any
  * buffer it would still hold.
  */
@@ -696,6 +720,7 @@ static inline void cs_free(struct conn_stream *cs)
 		tasklet_free(cs->wait_list.task);
 
 	cs_drop_rxbuf(cs);
+	cs_drop_txbuf(cs);
 	pool_free(pool_head_connstream, cs);
 }
 
@@ -924,69 +949,144 @@ static inline int conn_get_alpn(const struct connection *conn, const char **str,
 	return conn->xprt->get_alpn(conn, str, len);
 }
 
-/* registers alpn mux list <list>. Modifies the list element! */
-static inline void alpn_register_mux(struct alpn_mux_list *list)
+/* registers proto mux list <list>. Modifies the list element! */
+static inline void register_mux_proto(struct mux_proto_list *list)
 {
-	LIST_ADDQ(&alpn_mux_list.list, &list->list);
+	LIST_ADDQ(&mux_proto_list.list, &list->list);
 }
 
-/* unregisters alpn mux list <list> */
-static inline void alpn_unregister_mux(struct alpn_mux_list *list)
+/* unregisters proto mux list <list> */
+static inline void unregister_mux_proto(struct mux_proto_list *list)
 {
 	LIST_DEL(&list->list);
 	LIST_INIT(&list->list);
 }
 
-/* returns the first mux in the list matching the exact same token and
- * compatible with the proxy's mode (http or tcp). Mode "health" has to be
- * considered as TCP here. Ie passing "px->mode == PR_MODE_HTTP" is fine. Will
- * fall back to the first compatible mux with empty ALPN name. May return null
- * if the code improperly registered the default mux to use as a fallback.
- */
-static inline const struct mux_ops *alpn_get_mux(const struct ist token, int http_mode)
+static inline struct mux_proto_list *get_mux_proto(const struct ist proto)
 {
-	struct alpn_mux_list *item;
-	const struct mux_ops *fallback = NULL;
+	struct mux_proto_list *item;
 
-	http_mode = 1 << !!http_mode;
-
-	list_for_each_entry(item, &alpn_mux_list.list, list) {
-		if (!(item->mode & http_mode))
-			continue;
-		if (isteq(token, item->token))
-			return item->mux;
-		if (!istlen(item->token))
-			fallback = item->mux;
+	list_for_each_entry(item, &mux_proto_list.list, list) {
+		if (isteq(proto, item->token))
+			return item;
 	}
-	return fallback;
+	return NULL;
 }
 
-/* finds the best mux for incoming connection <conn> and mode <http_mode> for
- * the proxy. Null cannot be returned unless there's a serious bug somewhere
- * else (no fallback mux registered).
- */
-static inline const struct mux_ops *conn_find_best_mux(struct connection *conn, int http_mode)
+/* Lists the known proto mux on <out> */
+static inline void list_mux_proto(FILE *out)
 {
-	const char *alpn_str;
-	int alpn_len;
+	struct mux_proto_list *item;
+	struct ist proto;
+	char *mode, *side;
 
-	if (!conn_get_alpn(conn, &alpn_str, &alpn_len))
-		alpn_len = 0;
+	fprintf(out, "Available multiplexer protocols :\n"
+		"(protocols markes as <default> cannot be specified using 'proto' keyword)\n");
+	list_for_each_entry(item, &mux_proto_list.list, list) {
+		proto = item->token;
 
-	return alpn_get_mux(ist2(alpn_str, alpn_len), http_mode);
+		if (item->mode == PROTO_MODE_ANY)
+			mode = "TCP|HTTP";
+		else if (item->mode == PROTO_MODE_TCP)
+			mode = "TCP";
+		else if (item->mode == PROTO_MODE_HTTP)
+			mode = "HTTP";
+		else
+			mode = "NONE";
+
+		if (item->side == PROTO_SIDE_BOTH)
+			side = "FE|BE";
+		else if (item->side == PROTO_SIDE_FE)
+			side = "FE";
+		else if (item->side == PROTO_SIDE_BE)
+			side = "BE";
+		else
+			side = "NONE";
+
+		fprintf(out, " %15s : mode=%-10s side=%s\n",
+			(proto.len ? proto.ptr : "<default>"), mode, side);
+	}
 }
 
-/* finds the best mux for incoming connection <conn>, a proxy in and http mode
- * <mode>, and installs it on the connection for upper context <ctx>. Returns
- * < 0 on error.
+/* returns the first mux in the list matching the exact same <mux_proto> and
+ * compatible with the <proto_side> (FE or BE) and the <proto_mode> (TCP or
+ * HTTP). <mux_proto> can be empty. Will fall back to the first compatible mux
+ * with exactly the same <proto_mode> or with an empty name. May return
+ * null if the code improperly registered the default mux to use as a fallback.
  */
-static inline int conn_install_best_mux(struct connection *conn, int mode, void *ctx)
+static inline const struct mux_ops *conn_get_best_mux(struct connection *conn,
+						      const struct ist mux_proto,
+						      int proto_side, int proto_mode)
 {
+	struct mux_proto_list *item;
+	struct mux_proto_list *fallback = NULL;
+
+	list_for_each_entry(item, &mux_proto_list.list, list) {
+		if (!(item->side & proto_side) || !(item->mode & proto_mode))
+			continue;
+		if (istlen(mux_proto) && isteq(mux_proto, item->token))
+			return item->mux;
+		else if (!istlen(item->token)) {
+			if (!fallback || (item->mode == proto_mode && fallback->mode != proto_mode))
+				fallback = item;
+		}
+	}
+	return (fallback ? fallback->mux : NULL);
+
+}
+
+/* installs the best mux for incoming connection <conn> using the upper context
+ * <ctx>. If the mux protocol is forced, we use it to find the best
+ * mux. Otherwise we use the ALPN name, if any. Returns < 0 on error.
+ */
+static inline int conn_install_mux_fe(struct connection *conn, void *ctx)
+{
+	struct bind_conf     *bind_conf = objt_listener(conn->target)->bind_conf;
 	const struct mux_ops *mux_ops;
 
-	mux_ops = conn_find_best_mux(conn, mode);
-	if (!mux_ops)
+	if (bind_conf->mux_proto)
+		mux_ops = bind_conf->mux_proto->mux;
+	else {
+		struct ist mux_proto;
+		const char *alpn_str = NULL;
+		int alpn_len = 0;
+		int mode = (1 << (bind_conf->frontend->mode == PR_MODE_HTTP));
+
+		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		mux_proto = ist2(alpn_str, alpn_len);
+		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_FE, mode);
+		if (!mux_ops)
+			return -1;
+	}
+	return conn_install_mux(conn, mux_ops, ctx);
+}
+
+/* installs the best mux for outgoing connection <conn> using the upper context
+ * <ctx>. If the mux protocol is forced, we use it to find the best mux. Returns
+ * < 0 on error.
+ */
+static inline int conn_install_mux_be(struct connection *conn, void *ctx)
+{
+	struct server *srv = objt_server(conn->target);
+	struct proxy  *prx = objt_proxy(conn->target);
+	const struct mux_ops *mux_ops;
+
+	if (srv)
+		prx = srv->proxy;
+
+	if (!prx) // target must be either proxy or server
 		return -1;
+
+	if (srv && srv->mux_proto)
+		mux_ops = srv->mux_proto->mux;
+	else {
+		int mode;
+
+		mode = (1 << (prx->mode == PR_MODE_HTTP));
+		mux_ops = conn_get_best_mux(conn, ist(NULL), PROTO_SIDE_BE, mode);
+		if (!mux_ops)
+			return -1;
+	}
 	return conn_install_mux(conn, mux_ops, ctx);
 }
 

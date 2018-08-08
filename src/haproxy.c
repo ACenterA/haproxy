@@ -390,6 +390,8 @@ static void display_build_opts()
 
 	list_pollers(stdout);
 	putchar('\n');
+	list_mux_proto(stdout);
+	putchar('\n');
 	list_filters(stdout);
 	putchar('\n');
 }
@@ -2373,30 +2375,6 @@ void mworker_pipe_register()
 	fd_want_recv(mworker_pipe[0]);
 }
 
-static int sync_poll_loop()
-{
-	int stop = 0;
-
-	if (THREAD_NO_SYNC())
-		return stop;
-
-	THREAD_ENTER_SYNC();
-
-	if (!THREAD_NEED_SYNC())
-		goto exit;
-
-	/* *** { */
-	/* Put here all sync functions */
-
-	servers_update_status(); /* Commit server status changes */
-
-	/* *** } */
-  exit:
-	stop = (jobs == 0); /* stop when there's nothing left to do */
-	THREAD_EXIT_SYNC();
-	return stop;
-}
-
 /* Runs the polling loop */
 static void run_poll_loop()
 {
@@ -2415,10 +2393,9 @@ static void run_poll_loop()
 		/* Check if we can expire some tasks */
 		next = wake_expired_tasks();
 
-		/* the first thread requests a synchronization to exit when
-		 * there is no active jobs anymore */
-		if (tid == 0 && jobs == 0)
-			THREAD_WANT_SYNC();
+		/* stop when there's nothing left to do */
+		if (jobs == 0)
+			break;
 
 		/* expire immediately if events are pending */
 		exp = now_ms;
@@ -2443,11 +2420,6 @@ static void run_poll_loop()
 		if (sleeping_thread_mask & tid_bit)
 			HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
 		fd_process_cached_events();
-
-
-		/* Synchronize all polling loops */
-		if (sync_poll_loop())
-			break;
 
 		activity[tid].loops++;
 	}
@@ -2476,7 +2448,6 @@ static void *run_thread_poll_loop(void *data)
 	}
 
 	protocol_enable_all();
-	THREAD_SYNC_ENABLE();
 	run_poll_loop();
 
 	list_for_each_entry(ptdf, &per_thread_deinit_list, list)
@@ -3028,8 +2999,6 @@ int main(int argc, char **argv)
 		pthread_t    *threads = calloc(global.nbthread, sizeof(pthread_t));
 		int          i;
 		sigset_t     blocked_sig, old_sig;
-
-		THREAD_SYNC_INIT();
 
 		/* Init tids array */
 		for (i = 0; i < global.nbthread; i++)

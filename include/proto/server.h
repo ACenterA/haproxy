@@ -50,9 +50,6 @@ void srv_compute_all_admin_states(struct proxy *px);
 int srv_set_addr_via_libc(struct server *srv, int *err_code);
 int srv_init_addr(void);
 struct server *cli_find_server(struct appctx *appctx, char *arg);
-void servers_update_status(void);
-
-extern struct list updated_servers;
 
 /* functions related to server name resolution */
 int snr_update_srv_status(struct server *s, int has_no_ip);
@@ -91,7 +88,7 @@ void srv_dump_kws(char **out);
  * and the proxy's algorihtm. To be used after updating sv->uweight. The warmup
  * state is automatically disabled if the time is elapsed.
  */
-void server_recalc_eweight(struct server *sv);
+void server_recalc_eweight(struct server *sv, int must_update);
 
 /* returns the current server throttle rate between 0 and 100% */
 static inline unsigned int server_throttle_rate(struct server *sv)
