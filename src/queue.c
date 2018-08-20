@@ -21,7 +21,7 @@
  * A stream does not necessarily have such a pendconn. Thus the pendconn is
  * designated by the stream->pend_pos pointer. This results in some properties :
  *   - pendconn->strm->pend_pos is never NULL for any valid pendconn
- *   - if LIST_ISEMPTY(pendconn->list) is true, the element is unlinked,
+ *   - if p->node.node.leaf_p is NULL, the element is unlinked,
  *     otherwise it necessarily belongs to one of the other lists ; this may
  *     not be atomically checked under threads though ;
  *   - pendconn->px is never NULL if pendconn->list is not empty
@@ -73,13 +73,23 @@
 #include <common/memory.h>
 #include <common/time.h>
 #include <common/hathreads.h>
+#include <eb32tree.h>
 
+#include <proto/proto_http.h>
 #include <proto/queue.h>
+#include <proto/sample.h>
 #include <proto/server.h>
 #include <proto/stream.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
+#include <proto/tcp_rules.h>
 
+
+#define NOW_OFFSET_BOUNDARY()          ((now_ms - (TIMER_LOOK_BACK >> 12)) & 0xfffff)
+#define KEY_CLASS(key)                 ((u32)key & 0xfff00000)
+#define KEY_OFFSET(key)                ((u32)key & 0x000fffff)
+#define KEY_CLASS_OFFSET_BOUNDARY(key) (KEY_CLASS(key) | NOW_OFFSET_BOUNDARY())
+#define MAKE_KEY(class, offset)        (((u32)(class + 0x7ff) << 20) | ((u32)(now_ms + offset) & 0xfffff))
 
 struct pool_head *pool_head_pendconn;
 
@@ -129,13 +139,15 @@ unsigned int srv_dynamic_maxconn(const struct server *s)
  */
 static void __pendconn_unlink(struct pendconn *p)
 {
-	if (p->srv)
+	if (p->srv) {
+		p->strm->logs.srv_queue_pos += p->srv->queue_idx - p->queue_idx;
 		p->srv->nbpend--;
-	else
+	} else {
+		p->strm->logs.prx_queue_pos += p->px->queue_idx - p->queue_idx;
 		p->px->nbpend--;
+	}
 	HA_ATOMIC_SUB(&p->px->totpend, 1);
-	LIST_DEL(&p->list);
-	LIST_INIT(&p->list);
+	eb32_delete(&p->node);
 }
 
 /* Locks the queue the pendconn element belongs to. This relies on both p->px
@@ -178,6 +190,33 @@ void pendconn_unlink(struct pendconn *p)
 	pendconn_queue_unlock(p);
 }
 
+/* Retrieve the first pendconn from tree <pendconns>. Classes are always
+ * considered first, then the time offset. The time does wrap, so the
+ * lookup is performed twice, one to retrieve the first class and a second
+ * time to retrieve the earliest time in this class.
+ */
+static struct pendconn *pendconn_first(struct eb_root *pendconns)
+{
+	struct eb32_node *node, *node2 = NULL;
+	u32 key;
+
+	node = eb32_first(pendconns);
+	if (!node)
+		return NULL;
+
+	key = KEY_CLASS_OFFSET_BOUNDARY(node->key);
+	node2 = eb32_lookup_ge(pendconns, key);
+
+	if (!node2 ||
+	    KEY_CLASS(node2->key) != KEY_CLASS(node->key)) {
+		/* no other key in the tree, or in this class */
+		return eb32_entry(node, struct pendconn, node);
+	}
+
+	/* found a better key */
+	return eb32_entry(node2, struct pendconn, node);
+}
+
 /* Process the next pending connection from either a server or a proxy, and
  * returns a strictly positive value on success (see below). If no pending
  * connection is found, 0 is returned.  Note that neither <srv> nor <px> may be
@@ -199,7 +238,9 @@ void pendconn_unlink(struct pendconn *p)
 static int pendconn_process_next_strm(struct server *srv, struct proxy *px)
 {
 	struct pendconn *p = NULL;
+	struct pendconn *pp = NULL;
 	struct server   *rsrv;
+	u32 pkey, ppkey;
 
 	rsrv = srv->track;
 	if (!rsrv)
@@ -207,34 +248,54 @@ static int pendconn_process_next_strm(struct server *srv, struct proxy *px)
 
 	p = NULL;
 	if (srv->nbpend)
-		p = LIST_ELEM(srv->pendconns.n, struct pendconn *, list);
+		p = pendconn_first(&srv->pendconns);
 
+	pp = NULL;
 	if (srv_currently_usable(rsrv) && px->nbpend &&
 	    (!(srv->flags & SRV_F_BACKUP) ||
 	     (!px->srv_act &&
-	      (srv == px->lbprm.fbck || (px->options & PR_O_USE_ALL_BK))))) {
-		struct pendconn *pp;
+	      (srv == px->lbprm.fbck || (px->options & PR_O_USE_ALL_BK)))))
+		pp = pendconn_first(&px->pendconns);
 
-		pp = LIST_ELEM(px->pendconns.n, struct pendconn *, list);
-
-		/* If the server pendconn is older than the proxy one,
-		 * we process the server one.
-		 */
-		if (p && !tv_islt(&pp->strm->logs.tv_request, &p->strm->logs.tv_request))
-			goto pendconn_found;
-
-		/* Let's switch from the server pendconn to the proxy pendconn */
-		p = pp;
-		goto pendconn_found;
-	}
-
-	if (!p)
+	if (!p && !pp)
 		return 0;
 
-  pendconn_found:
+	if (p && !pp)
+		goto use_p;
+
+	if (pp && !p)
+		goto use_pp;
+
+	if (KEY_CLASS(p->node.key) < KEY_CLASS(pp->node.key))
+		goto use_p;
+
+	if (KEY_CLASS(pp->node.key) < KEY_CLASS(p->node.key))
+		goto use_pp;
+
+	pkey  = KEY_OFFSET(p->node.key);
+	ppkey = KEY_OFFSET(pp->node.key);
+
+	if (pkey < NOW_OFFSET_BOUNDARY())
+		pkey += 0x100000; // key in the future
+
+	if (ppkey < NOW_OFFSET_BOUNDARY())
+		ppkey += 0x100000; // key in the future
+
+	if (pkey <= ppkey)
+		goto use_p;
+
+ use_pp:
+	/* Let's switch from the server pendconn to the proxy pendconn */
+	p = pp;
+ use_p:
 	__pendconn_unlink(p);
 	p->strm_flags |= SF_ASSIGNED;
 	p->target = srv;
+
+	if (p != pp)
+		srv->queue_idx++;
+	else
+		px->queue_idx++;
 
 	HA_ATOMIC_ADD(&srv->served, 1);
 	HA_ATOMIC_ADD(&srv->proxy->served, 1);
@@ -267,11 +328,21 @@ void process_srv_queue(struct server *s)
 	HA_SPIN_UNLOCK(PROXY_LOCK,  &p->lock);
 }
 
-/* Adds the stream <strm> to the pending connection list of server <strm>->srv
+/* Adds the stream <strm> to the pending connection queue of server <strm>->srv
  * or to the one of <strm>->proxy if srv is NULL. All counters and back pointers
  * are updated accordingly. Returns NULL if no memory is available, otherwise the
  * pendconn itself. If the stream was already marked as served, its flag is
  * cleared. It is illegal to call this function with a non-NULL strm->srv_conn.
+ * The stream's queue position is counted with an offset of -1 because we want
+ * to make sure that being at the first position in the queue reports 1.
+ *
+ * The queue is sorted by the composition of the priority_class, and the current
+ * timestamp offset by strm->priority_offset. The timestamp is in milliseconds
+ * and truncated to 20 bits, so will wrap every 17m28s575ms.
+ * The offset can be positive or negative, and an offset of 0 puts it in the
+ * middle of this range (~ 8 min). Note that this also means if the adjusted
+ * timestamp wraps around, the request will be misinterpreted as being of
+ * the higest priority for that priority class.
  *
  * This function must be called by the stream itself, so in the context of
  * process_stream.
@@ -294,6 +365,7 @@ struct pendconn *pendconn_add(struct stream *strm)
 	px            = strm->be;
 	p->target     = NULL;
 	p->srv        = srv;
+	p->node.key   = MAKE_KEY(strm->priority_class, strm->priority_offset);
 	p->px         = px;
 	p->strm       = strm;
 	p->strm_flags = strm->flags;
@@ -302,17 +374,17 @@ struct pendconn *pendconn_add(struct stream *strm)
 
 	if (srv) {
 		srv->nbpend++;
-		strm->logs.srv_queue_size += srv->nbpend;
 		if (srv->nbpend > srv->counters.nbpend_max)
 			srv->counters.nbpend_max = srv->nbpend;
-		LIST_ADDQ(&srv->pendconns, &p->list);
+		p->queue_idx = srv->queue_idx - 1; // for increment
+		eb32_insert(&srv->pendconns, &p->node);
 	}
 	else {
 		px->nbpend++;
-		strm->logs.prx_queue_size += px->nbpend;
 		if (px->nbpend > px->be_counters.nbpend_max)
 			px->be_counters.nbpend_max = px->nbpend;
-		LIST_ADDQ(&px->pendconns, &p->list);
+		p->queue_idx = px->queue_idx - 1; // for increment
+		eb32_insert(&px->pendconns, &p->node);
 	}
 	strm->pend_pos = p;
 
@@ -327,7 +399,8 @@ struct pendconn *pendconn_add(struct stream *strm)
  */
 int pendconn_redistribute(struct server *s)
 {
-	struct pendconn *p, *pback;
+	struct pendconn *p;
+	struct eb32_node *node;
 	int xferred = 0;
 
 	/* The REDISP option was specified. We will ignore cookie and force to
@@ -336,7 +409,8 @@ int pendconn_redistribute(struct server *s)
 		return 0;
 
 	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
-	list_for_each_entry_safe(p, pback, &s->pendconns, list) {
+	for (node = eb32_first(&s->pendconns); node; node = eb32_next(node)) {
+		p = eb32_entry(&node, struct pendconn, node);
 		if (p->strm_flags & SF_FORCE_PRST)
 			continue;
 
@@ -357,7 +431,7 @@ int pendconn_redistribute(struct server *s)
  */
 int pendconn_grab_from_px(struct server *s)
 {
-	struct pendconn *p, *pback;
+	struct pendconn *p;
 	int maxconn, xferred = 0;
 
 	if (!srv_currently_usable(s))
@@ -374,7 +448,7 @@ int pendconn_grab_from_px(struct server *s)
 
 	HA_SPIN_LOCK(PROXY_LOCK, &s->proxy->lock);
 	maxconn = srv_dynamic_maxconn(s);
-	list_for_each_entry_safe(p, pback, &s->proxy->pendconns, list) {
+	while ((p = pendconn_first(&s->proxy->pendconns))) {
 		if (s->maxconn && s->served + xferred >= maxconn)
 			break;
 
@@ -419,7 +493,7 @@ int pendconn_dequeue(struct stream *strm)
 	 * unlinked, these functions were completely done.
 	 */
 	pendconn_queue_lock(p);
-	is_unlinked = LIST_ISEMPTY(&p->list);
+	is_unlinked = !p->node.node.leaf_p;
 	pendconn_queue_unlock(p);
 
 	if (!is_unlinked)
@@ -436,6 +510,140 @@ int pendconn_dequeue(struct stream *strm)
 	strm->pend_pos = NULL;
 	pool_free(pool_head_pendconn, p);
 	return 0;
+}
+
+static enum act_return action_set_priority_class(struct act_rule *rule, struct proxy *px,
+                                                 struct session *sess, struct stream *s, int flags)
+{
+	struct sample *smp;
+
+	smp = sample_fetch_as_type(px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->arg.expr, SMP_T_SINT);
+	if (!smp)
+		return ACT_RET_CONT;
+
+	s->priority_class = queue_limit_class(smp->data.u.sint);
+	return ACT_RET_CONT;
+}
+
+static enum act_return action_set_priority_offset(struct act_rule *rule, struct proxy *px,
+                                                  struct session *sess, struct stream *s, int flags)
+{
+	struct sample *smp;
+
+	smp = sample_fetch_as_type(px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, rule->arg.expr, SMP_T_SINT);
+	if (!smp)
+		return ACT_RET_CONT;
+
+	s->priority_offset = queue_limit_offset(smp->data.u.sint);
+
+	return ACT_RET_CONT;
+}
+
+static enum act_parse_ret parse_set_priority_class(const char **args, int *arg, struct proxy *px,
+                                                   struct act_rule *rule, char **err)
+{
+	unsigned int where = 0;
+
+	rule->arg.expr = sample_parse_expr((char **)args, arg, px->conf.args.file,
+	                                   px->conf.args.line, err, &px->conf.args);
+	if (!rule->arg.expr)
+		return ACT_RET_PRS_ERR;
+
+	if (px->cap & PR_CAP_FE)
+		where |= SMP_VAL_FE_HRQ_HDR;
+	if (px->cap & PR_CAP_BE)
+		where |= SMP_VAL_BE_HRQ_HDR;
+
+	if (!(rule->arg.expr->fetch->val & where)) {
+		memprintf(err,
+			  "fetch method '%s' extracts information from '%s', none of which is available here",
+			  args[0], sample_src_names(rule->arg.expr->fetch->use));
+		free(rule->arg.expr);
+		return ACT_RET_PRS_ERR;
+	}
+
+	rule->action     = ACT_CUSTOM;
+	rule->action_ptr = action_set_priority_class;
+	return ACT_RET_PRS_OK;
+}
+
+static enum act_parse_ret parse_set_priority_offset(const char **args, int *arg, struct proxy *px,
+                                                    struct act_rule *rule, char **err)
+{
+	unsigned int where = 0;
+
+	rule->arg.expr = sample_parse_expr((char **)args, arg, px->conf.args.file,
+	                                   px->conf.args.line, err, &px->conf.args);
+	if (!rule->arg.expr)
+		return ACT_RET_PRS_ERR;
+
+	if (px->cap & PR_CAP_FE)
+		where |= SMP_VAL_FE_HRQ_HDR;
+	if (px->cap & PR_CAP_BE)
+		where |= SMP_VAL_BE_HRQ_HDR;
+
+	if (!(rule->arg.expr->fetch->val & where)) {
+		memprintf(err,
+			  "fetch method '%s' extracts information from '%s', none of which is available here",
+			  args[0], sample_src_names(rule->arg.expr->fetch->use));
+		free(rule->arg.expr);
+		return ACT_RET_PRS_ERR;
+	}
+
+	rule->action     = ACT_CUSTOM;
+	rule->action_ptr = action_set_priority_offset;
+	return ACT_RET_PRS_OK;
+}
+
+static struct action_kw_list tcp_cont_kws = {ILH, {
+	{ "set-priority-class", parse_set_priority_class },
+	{ "set-priority-offset", parse_set_priority_offset },
+	{ /* END */ }
+}};
+
+static struct action_kw_list http_req_kws = {ILH, {
+	{ "set-priority-class", parse_set_priority_class },
+	{ "set-priority-offset", parse_set_priority_offset },
+	{ /* END */ }
+}};
+
+static int
+smp_fetch_priority_class(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->priority_class;
+
+	return 1;
+}
+
+static int
+smp_fetch_priority_offset(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->priority_offset;
+
+	return 1;
+}
+
+
+static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "prio_class", smp_fetch_priority_class, 0, NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "prio_offset", smp_fetch_priority_offset, 0, NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ /* END */},
+}};
+
+__attribute__((constructor))
+static void __queue_init(void)
+{
+	tcp_req_cont_keywords_register(&tcp_cont_kws);
+	http_req_keywords_register(&http_req_kws);
+	sample_register_fetches(&smp_kws);
 }
 
 /*

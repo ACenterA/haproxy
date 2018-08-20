@@ -125,8 +125,8 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	s->logs.t_data = -1;
 	s->logs.t_close = 0;
 	s->logs.bytes_in = s->logs.bytes_out = 0;
-	s->logs.prx_queue_size = 0;  /* we get the number of pending conns before us */
-	s->logs.srv_queue_size = 0; /* we will get this number soon */
+	s->logs.prx_queue_pos = 0;  /* we get the number of pending conns before us */
+	s->logs.srv_queue_pos = 0; /* we will get this number soon */
 
 	/* default logging function */
 	s->do_log = strm_log;
@@ -192,7 +192,8 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	vars_init(&s->vars_reqres, SCOPE_REQ);
 
 	/* this part should be common with other protocols */
-	si_reset(&s->si[0]);
+	if (si_reset(&s->si[0]) < 0)
+		goto out_fail_alloc;
 	si_set_state(&s->si[0], SI_ST_EST);
 	s->si[0].hcto = sess->fe->timeout.clientfin;
 
@@ -211,7 +212,8 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	/* pre-initialize the other side's stream interface to an INIT state. The
 	 * callbacks will be initialized before attempting to connect.
 	 */
-	si_reset(&s->si[1]);
+	if (si_reset(&s->si[1]) < 0)
+		goto out_fail_alloc_si1;
 	s->si[1].hcto = TICK_ETERNITY;
 
 	if (likely(sess->fe->options2 & PR_O2_INDEPSTR))
@@ -221,6 +223,8 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	s->target = sess->listener ? sess->listener->default_target : NULL;
 
 	s->pend_pos = NULL;
+	s->priority_class = 0;
+	s->priority_offset = 0;
 
 	/* init store persistence */
 	s->store_count = 0;
@@ -286,6 +290,9 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
  out_fail_accept:
 	flt_stream_release(s, 0);
 	task_free(t);
+	tasklet_free(s->si[1].wait_list.task);
+out_fail_alloc_si1:
+	tasklet_free(s->si[0].wait_list.task);
  out_fail_alloc:
 	LIST_DEL(&s->list);
 	pool_free(pool_head_stream, s);
@@ -401,6 +408,8 @@ static void stream_free(struct stream *s)
 	if (must_free_sess)
 		session_free(sess);
 
+	tasklet_free(s->si[0].wait_list.task);
+	tasklet_free(s->si[1].wait_list.task);
 	pool_free(pool_head_stream, s);
 
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
@@ -799,6 +808,7 @@ static void sess_establish(struct stream *s)
 		/* if the user wants to log as soon as possible, without counting
 		 * bytes from the server, then this is the right moment. */
 		if (!LIST_ISEMPTY(&strm_fe(s)->logformat) && !(s->logs.logwait & LW_BYTES)) {
+			/* note: no pend_pos here, session is established */
 			s->logs.t_close = s->logs.t_connect; /* to get a valid end date */
 			s->do_log(s);
 		}
@@ -910,6 +920,9 @@ static void sess_update_stream_int(struct stream *s)
 
 			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
 
+			/* we may need to know the position in the queue for logging */
+			pendconn_cond_unlink(s->pend_pos);
+
 			/* no stream was ever accounted for this server */
 			si->state = SI_ST_CLO;
 			if (s->srv_error)
@@ -950,6 +963,10 @@ static void sess_update_stream_int(struct stream *s)
 			/* ... and timeout expired */
 			si->exp = TICK_ETERNITY;
 			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
+
+			/* we may need to know the position in the queue for logging */
+			pendconn_cond_unlink(s->pend_pos);
+
 			if (srv)
 				HA_ATOMIC_ADD(&srv->counters.failed_conns, 1);
 			HA_ATOMIC_ADD(&s->be->be_counters.failed_conns, 1);
@@ -967,6 +984,10 @@ static void sess_update_stream_int(struct stream *s)
 		/* Connection remains in queue, check if we have to abort it */
 		if (check_req_may_abort(req, s)) {
 			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
+
+			/* we may need to know the position in the queue for logging */
+			pendconn_cond_unlink(s->pend_pos);
+
 			si->err_type |= SI_ET_QUEUE_ABRT;
 			goto abort_connection;
 		}
@@ -2503,6 +2524,8 @@ struct task *process_stream(struct task *t, void *context, unsigned short state)
 	if (!LIST_ISEMPTY(&sess->fe->logformat) && s->logs.logwait &&
 	    !(s->flags & SF_MONITOR) &&
 	    (!(sess->fe->options & PR_O_NULLNOLOG) || req->total)) {
+		/* we may need to know the position in the queue */
+		pendconn_free(s);
 		s->do_log(s);
 	}
 

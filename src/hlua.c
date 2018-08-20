@@ -44,6 +44,7 @@
 #include <proto/hlua_fcn.h>
 #include <proto/map.h>
 #include <proto/obj_type.h>
+#include <proto/queue.h>
 #include <proto/pattern.h>
 #include <proto/payload.h>
 #include <proto/proto_http.h>
@@ -2544,17 +2545,19 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 
 	socket = MAY_LJMP(hlua_checksocket(L, 1));
 
-	/* round up for inputs that are fractions and convert to millis */
-	dtmout = (0.5 + MAY_LJMP(luaL_checknumber(L, 2))) * 1000;
+	/* convert the timeout to millis */
+	dtmout = MAY_LJMP(luaL_checknumber(L, 2)) * 1000;
 
 	/* Check for negative values */
 	if (dtmout < 0)
 		WILL_LJMP(luaL_error(L, "settimeout: cannot set negatives values"));
 
 	if (dtmout > INT_MAX) /* overflow check */
-		WILL_LJMP(luaL_error(L, "settimeout: cannot set values larger than %d", INT_MAX));
+		WILL_LJMP(luaL_error(L, "settimeout: cannot set values larger than %d ms", INT_MAX));
 
 	tmout = MS_TO_TICKS((int)dtmout);
+	if (tmout == 0)
+		tmout++; /* very small timeouts are adjusted to a minium of 1ms */
 
 	/* Check if we run on the same thread than the xreator thread.
 	 * We cannot access to the socket if the thread is different.
@@ -2573,10 +2576,19 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 	si = appctx->owner;
 	s = si_strm(si);
 
+	s->sess->fe->timeout.connect = tmout;
 	s->req.rto = tmout;
 	s->req.wto = tmout;
 	s->res.rto = tmout;
 	s->res.wto = tmout;
+	s->req.rex = tick_add_ifset(now_ms, tmout);
+	s->req.wex = tick_add_ifset(now_ms, tmout);
+	s->res.rex = tick_add_ifset(now_ms, tmout);
+	s->res.wex = tick_add_ifset(now_ms, tmout);
+
+	s->task->expire = tick_add_ifset(now_ms, tmout);
+	task_queue(s->task);
+
 	xref_unlock(&socket->xref, peer);
 
 	lua_pushinteger(L, 1);
@@ -5388,6 +5400,26 @@ __LJMP static int hlua_txn_set_mark(lua_State *L)
 	return 0;
 }
 
+__LJMP static int hlua_txn_set_priority_class(lua_State *L)
+{
+	struct hlua_txn *htxn;
+
+	MAY_LJMP(check_args(L, 2, "set_priority_class"));
+	htxn = MAY_LJMP(hlua_checktxn(L, 1));
+	htxn->s->priority_class = queue_limit_class(MAY_LJMP(luaL_checkinteger(L, 2)));
+	return 0;
+}
+
+__LJMP static int hlua_txn_set_priority_offset(lua_State *L)
+{
+	struct hlua_txn *htxn;
+
+	MAY_LJMP(check_args(L, 2, "set_priority_offset"));
+	htxn = MAY_LJMP(hlua_checktxn(L, 1));
+	htxn->s->priority_offset = queue_limit_offset(MAY_LJMP(luaL_checkinteger(L, 2)));
+	return 0;
+}
+
 /* This function is an Lua binding that send pending data
  * to the client, and close the stream interface.
  */
@@ -7931,21 +7963,23 @@ void hlua_init(void)
 	lua_newtable(gL.T);
 
 	/* Register Lua functions. */
-	hlua_class_function(gL.T, "set_priv",    hlua_set_priv);
-	hlua_class_function(gL.T, "get_priv",    hlua_get_priv);
-	hlua_class_function(gL.T, "set_var",     hlua_set_var);
-	hlua_class_function(gL.T, "unset_var",   hlua_unset_var);
-	hlua_class_function(gL.T, "get_var",     hlua_get_var);
-	hlua_class_function(gL.T, "done",        hlua_txn_done);
-	hlua_class_function(gL.T, "set_loglevel",hlua_txn_set_loglevel);
-	hlua_class_function(gL.T, "set_tos",     hlua_txn_set_tos);
-	hlua_class_function(gL.T, "set_mark",    hlua_txn_set_mark);
-	hlua_class_function(gL.T, "deflog",      hlua_txn_deflog);
-	hlua_class_function(gL.T, "log",         hlua_txn_log);
-	hlua_class_function(gL.T, "Debug",       hlua_txn_log_debug);
-	hlua_class_function(gL.T, "Info",        hlua_txn_log_info);
-	hlua_class_function(gL.T, "Warning",     hlua_txn_log_warning);
-	hlua_class_function(gL.T, "Alert",       hlua_txn_log_alert);
+	hlua_class_function(gL.T, "set_priv",            hlua_set_priv);
+	hlua_class_function(gL.T, "get_priv",            hlua_get_priv);
+	hlua_class_function(gL.T, "set_var",             hlua_set_var);
+	hlua_class_function(gL.T, "unset_var",           hlua_unset_var);
+	hlua_class_function(gL.T, "get_var",             hlua_get_var);
+	hlua_class_function(gL.T, "done",                hlua_txn_done);
+	hlua_class_function(gL.T, "set_loglevel",        hlua_txn_set_loglevel);
+	hlua_class_function(gL.T, "set_tos",             hlua_txn_set_tos);
+	hlua_class_function(gL.T, "set_mark",            hlua_txn_set_mark);
+	hlua_class_function(gL.T, "set_priority_class",  hlua_txn_set_priority_class);
+	hlua_class_function(gL.T, "set_priority_offset", hlua_txn_set_priority_offset);
+	hlua_class_function(gL.T, "deflog",              hlua_txn_deflog);
+	hlua_class_function(gL.T, "log",                 hlua_txn_log);
+	hlua_class_function(gL.T, "Debug",               hlua_txn_log_debug);
+	hlua_class_function(gL.T, "Info",                hlua_txn_log_info);
+	hlua_class_function(gL.T, "Warning",             hlua_txn_log_warning);
+	hlua_class_function(gL.T, "Alert",               hlua_txn_log_alert);
 
 	lua_rawset(gL.T, -3);
 
@@ -8007,7 +8041,7 @@ void hlua_init(void)
 	socket_tcp.proxy = &socket_proxy;
 	socket_tcp.obj_type = OBJ_TYPE_SERVER;
 	LIST_INIT(&socket_tcp.actconns);
-	LIST_INIT(&socket_tcp.pendconns);
+	socket_tcp.pendconns = EB_ROOT;
 	socket_tcp.priv_conns = NULL;
 	socket_tcp.idle_conns = NULL;
 	socket_tcp.safe_conns = NULL;
@@ -8053,7 +8087,7 @@ void hlua_init(void)
 	socket_ssl.proxy = &socket_proxy;
 	socket_ssl.obj_type = OBJ_TYPE_SERVER;
 	LIST_INIT(&socket_ssl.actconns);
-	LIST_INIT(&socket_ssl.pendconns);
+	socket_ssl.pendconns = EB_ROOT;
 	socket_tcp.priv_conns = NULL;
 	socket_tcp.idle_conns = NULL;
 	socket_tcp.safe_conns = NULL;

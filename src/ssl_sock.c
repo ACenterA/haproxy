@@ -1996,7 +1996,7 @@ static void ctx_set_TLSv12_func(SSL_CTX *ctx, set_context_func c) {
 		: SSL_CTX_set_ssl_version(ctx, TLSv1_2_client_method());
 #endif
 }
-/* TLS 1.2 is the last supported version in this context. */
+/* TLSv1.2 is the last supported version in this context. */
 static void ctx_set_TLSv13_func(SSL_CTX *ctx, set_context_func c) {}
 /* Unusable in this context. */
 static void ssl_set_SSLv3_func(SSL *ssl, set_context_func c) {}
@@ -2197,7 +2197,7 @@ static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 				break;
 		}
 	} else {
-		/* without TLSEXT_TYPE_signature_algorithms extension (< TLS 1.2) */
+		/* without TLSEXT_TYPE_signature_algorithms extension (< TLSv1.2) */
 		has_rsa = 1;
 	}
 	if (has_ecdsa_sig) {  /* in very rare case: has ecdsa sign but not a ECDSA cipher */
@@ -2606,6 +2606,8 @@ static DH * ssl_sock_get_dh_from_file(const char *filename)
 end:
         if (in)
                 BIO_free(in);
+
+	ERR_clear_error();
 
 	return dh;
 }
@@ -3491,7 +3493,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, char **err)
 						}
 
 						snprintf(fp, sizeof(fp), "%s/%s", path, dp);
-						ssl_sock_load_multi_cert(fp, bind_conf, NULL, NULL, 0, err);
+						cfgerr += ssl_sock_load_multi_cert(fp, bind_conf, NULL, NULL, 0, err);
 
 						/* Successfully processed the bundle */
 						goto ignore_entry;
@@ -5138,7 +5140,7 @@ int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
 					conn->flags &= ~CO_FL_WAIT_L4_CONN;
 				if (!conn->err_code) {
-#ifdef OPENSSL_NO_HEARTBEATS  /* BoringSSL */
+#ifdef OPENSSL_IS_BORINGSSL /* BoringSSL */
 					conn->err_code = CO_ER_SSL_HANDSHAKE;
 #else
 					int empty_handshake;
@@ -5222,7 +5224,7 @@ check_error:
 			if (!errno && conn->flags & CO_FL_WAIT_L4_CONN)
 				conn->flags &= ~CO_FL_WAIT_L4_CONN;
 			if (!conn->err_code) {
-#ifdef OPENSSL_NO_HEARTBEATS  /* BoringSSL */
+#ifdef OPENSSL_IS_BORINGSSL  /* BoringSSL */
 				conn->err_code = CO_ER_SSL_HANDSHAKE;
 #else
 				int empty_handshake;

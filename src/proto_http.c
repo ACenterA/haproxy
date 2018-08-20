@@ -4403,6 +4403,9 @@ void http_end_txn_clean_session(struct stream *s)
 	s->logs.bytes_in  -= ci_data(&s->req);
 	s->logs.bytes_out -= ci_data(&s->res);
 
+	/* we may need to know the position in the queue */
+	pendconn_free(s);
+
 	/* let's do a final log if we need it */
 	if (!LIST_ISEMPTY(&fe->logformat) && s->logs.logwait &&
 	    !(s->flags & SF_MONITOR) &&
@@ -4423,13 +4426,11 @@ void http_end_txn_clean_session(struct stream *s)
 	s->logs.t_connect = -1;
 	s->logs.t_data = -1;
 	s->logs.t_close = 0;
-	s->logs.prx_queue_size = 0;  /* we get the number of pending conns before us */
-	s->logs.srv_queue_size = 0; /* we will get this number soon */
+	s->logs.prx_queue_pos = 0;  /* we get the number of pending conns before us */
+	s->logs.srv_queue_pos = 0; /* we will get this number soon */
 
 	s->logs.bytes_in = s->req.total = ci_data(&s->req);
 	s->logs.bytes_out = s->res.total = ci_data(&s->res);
-
-	pendconn_free(s);
 
 	if (objt_server(s->target)) {
 		if (s->flags & SF_CURR_SESS) {

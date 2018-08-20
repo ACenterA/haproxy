@@ -134,6 +134,7 @@ void conn_fd_handler(int fd)
 			    struct wait_list *, list);
 			LIST_DEL(&sw->list);
 			LIST_INIT(&sw->list);
+			sw->wait_reason &= ~SUB_CAN_SEND;
 			tasklet_wakeup(sw->task);
 		}
 	}
@@ -338,8 +339,10 @@ int conn_subscribe(struct connection *conn, int event_type, void *param)
 	switch (event_type) {
 	case SUB_CAN_SEND:
 		sw = param;
-		if (LIST_ISEMPTY(&sw->list))
+		if (!(sw->wait_reason & SUB_CAN_SEND)) {
+			sw->wait_reason |= SUB_CAN_SEND;
 			LIST_ADDQ(&conn->send_wait_list, &sw->list);
+		}
 		return 0;
 	default:
 		break;
@@ -381,44 +384,6 @@ int conn_sock_drain(struct connection *conn)
 
 	conn->flags |= CO_FL_SOCK_RD_SH;
 	return 1;
-}
-
-/*
- * default conn_stream recv() : this one is used when cs->rcv_buf == NULL.
- * It reads up to <count> bytes from cs->rxbuf, puts them into <buf> and
- * returns the count. It possibly sets/clears CS_FL_RCV_MORE depending on the
- * buffer's state, and may set CS_FL_EOS. The number of bytes transferred is
- * returned. <buf> is not touched if <count> is null, but cs flags will be
- * updated to indicate any RCV_MORE or EOS.
- */
-size_t __cs_recv(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
-{
-	size_t ret = 0;
-
-	/* transfer possibly pending data to the upper layer */
-	ret = b_xfer(buf, &cs->rxbuf, count);
-
-	if (b_data(&cs->rxbuf))
-		cs->flags |= CS_FL_RCV_MORE;
-	else {
-		cs->flags &= ~CS_FL_RCV_MORE;
-		if (cs->flags & CS_FL_REOS)
-			cs->flags |= CS_FL_EOS;
-		cs_drop_rxbuf(cs);
-	}
-
-	return ret;
-}
-
-/*
- * default cs send() : this one is used when mux->snd_buf == NULL. It puts up to
- * <count> bytes from <buf> into cs->txbuf. The number of bytes transferred is
- * returned. Here we don't care if cs->txbuf is allocated or not. If not, it
- * will be swapped with <buf>.
- */
-size_t __cs_send(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
-{
-	return b_xfer(&cs->txbuf, buf, count);
 }
 
 /*

@@ -55,7 +55,7 @@ static void si_cs_recv_cb(struct conn_stream *cs);
 static int si_cs_wake_cb(struct conn_stream *cs);
 static int si_idle_conn_wake_cb(struct conn_stream *cs);
 static void si_idle_conn_null_cb(struct conn_stream *cs);
-static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state);
+static struct task * si_cs_send(struct conn_stream *cs);
 
 /* stream-interface operations for embedded tasks */
 struct si_ops si_embedded_ops = {
@@ -462,7 +462,7 @@ void stream_int_notify(struct stream_interface *si)
 
 	/* If we have data to send, try it now */
 	if (!channel_is_empty(oc) && objt_cs(si->end))
-		si_cs_send(NULL, objt_cs(si->end), 0);
+		si_cs_send(objt_cs(si->end));
 
 	/* process consumer side */
 	if (channel_is_empty(oc)) {
@@ -642,9 +642,8 @@ static int si_cs_wake_cb(struct conn_stream *cs)
  * caller to commit polling changes. The caller should check conn->flags
  * for errors.
  */
-static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state)
+static struct task * si_cs_send(struct conn_stream *cs)
 {
-	struct conn_stream *cs = ctx;
 	struct connection *conn = cs->conn;
 	struct stream_interface *si = cs->data;
 	struct channel *oc = si_oc(si);
@@ -652,7 +651,7 @@ static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state)
 	int did_send = 0;
 
 	/* We're already waiting to be able to send, give up */
-	if (!LIST_ISEMPTY(&cs->wait_list.list))
+	if (si->wait_list.wait_reason & SUB_CAN_SEND)
 		return NULL;
 
 	if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
@@ -661,7 +660,7 @@ static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state)
 	if (conn->flags & CO_FL_HANDSHAKE) {
 		/* a handshake was requested */
 		/* Schedule ourself to be woken up once the handshake is done */
-		LIST_ADDQ(&conn->send_wait_list, &cs->wait_list.list);
+		conn->xprt->subscribe(conn, SUB_CAN_SEND,  &si->wait_list);
 		return NULL;
 	}
 
@@ -721,7 +720,7 @@ static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state)
 		if (oc->flags & CF_STREAMER)
 			send_flag |= CO_SFL_STREAMER;
 
-		ret = cs_send(cs, &oc->buf, co_data(oc), send_flag);
+		ret = cs->conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
 			oc->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA | CF_WRITE_EVENT;
@@ -741,7 +740,7 @@ static struct task * si_cs_send(struct task *t, void *ctx, unsigned short state)
 	}
 	/* We couldn't send all of our data, let the mux know we'd like to send more */
 	if (co_data(oc))
-		conn->mux->subscribe(cs, SUB_CAN_SEND, wl_set_waitcb(&cs->wait_list, si_cs_send, ctx));
+		conn->mux->subscribe(cs, SUB_CAN_SEND, &si->wait_list);
 
 wake_others:
 	/* Maybe somebody was waiting for this conn_stream, wake them */
@@ -751,10 +750,19 @@ wake_others:
 			    struct wait_list *, list);
 			LIST_DEL(&sw->list);
 			LIST_INIT(&sw->list);
+			sw->wait_reason &= ~SUB_CAN_SEND;
 			tasklet_wakeup(sw->task);
 		}
 	}
 	return NULL;
+}
+
+struct task *si_cs_io_cb(struct task *t, void *ctx, unsigned short state)
+{
+	struct stream_interface *si = ctx;
+	if (!(si->wait_list.wait_reason & SUB_CAN_SEND))
+		si_cs_send(__objt_cs(si->end));
+	return (NULL);
 }
 
 /* This function is designed to be called from within the stream handler to
@@ -1044,7 +1052,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 
 	__cs_want_send(cs);
 
-	si_cs_send(NULL, cs, 0);
+	si_cs_send(cs);
 	if (cs->flags & CS_FL_ERROR || cs->conn->flags & CO_FL_ERROR) {
 		/* Write error on the file descriptor */
 		__cs_stop_both(cs);
@@ -1244,7 +1252,7 @@ static void si_cs_recv_cb(struct conn_stream *cs)
 			break;
 		}
 
-		ret = cs_recv(cs, &ic->buf, max, co_data(ic) ? CO_RFL_BUF_WET : 0);
+		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max, co_data(ic) ? CO_RFL_BUF_WET : 0);
 		if (cs->flags & CS_FL_RCV_MORE)
 			si->flags |= SI_FL_WAIT_ROOM;
 

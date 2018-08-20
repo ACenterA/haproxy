@@ -105,8 +105,8 @@ struct strm_logs {
 	long  t_connect;                /* delay before the connect() to the server succeeds, -1 if never occurs */
 	long  t_data;                   /* delay before the first data byte from the server ... */
 	unsigned long t_close;          /* total stream duration */
-	unsigned long srv_queue_size;   /* number of streams waiting for a connect slot on this server at accept() time (in direct assignment) */
-	unsigned long prx_queue_size;   /* overall number of streams waiting for a connect slot on this instance at accept() time */
+	unsigned long srv_queue_pos;    /* number of streams de-queued while waiting for a connection slot on this server */
+	unsigned long prx_queue_pos;    /* number of streams de-qeuued while waiting for a connection slot on this instance */
 	long long bytes_in;             /* number of bytes transferred from the client to the server */
 	long long bytes_out;            /* number of bytes transferred from the server to the client */
 };
@@ -131,6 +131,8 @@ struct stream {
 	struct task *task;              /* the task associated with this stream */
 	unsigned short pending_events;	/* the pending events not yet processed by the stream.
 					 * This is a bit field of TASK_WOKEN_* */
+	int16_t priority_class;         /* priority class of the stream for the pending queue */
+	int32_t priority_offset;        /* priority offset of the stream for the pending queue */
 
 	struct list list;               /* position in global streams list */
 	struct list by_srv;             /* position in server stream list */
