@@ -45,11 +45,6 @@
 #include <proto/dns.h>
 #include <netinet/tcp.h>
 
-
-struct list updated_servers = LIST_HEAD_INIT(updated_servers);
-__decl_hathreads(HA_SPINLOCK_T updated_servers_lock);
-
-static void srv_register_update(struct server *srv); //ACenterA Fix
 static void srv_update_status(struct server *s);
 static void srv_update_state(struct server *srv, int version, char **params);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
@@ -955,7 +950,6 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
-        srv_register_update(s); // ACenterA Fix
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopped(srv, NULL, NULL);
@@ -963,9 +957,9 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 	}
 
 	/* propagate changes */
-	// thread_isolate(); // ACenterA Fix
-	// srv_update_status(s);
-	// thread_release();
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Marks server <s> up regardless of its checks' statuses and provided it isn't
@@ -1001,7 +995,6 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 	if (s->slowstart <= 0)
 		s->next_state = SRV_ST_RUNNING;
 
-        srv_register_update(s); // ACenterA Fix
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_running(srv, NULL, NULL);
@@ -1009,9 +1002,9 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 	}
 
 	/* propagate changes */
-	// thread_isolate(); ACenterA fix
-	// srv_update_status(s); ACenterA fix
-	// thread_release(); ACenterA fix
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Marks server <s> stopping regardless of its checks' statuses and provided it
@@ -1046,7 +1039,6 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
-        srv_register_update(s); // ACenterA Fix
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopping(srv, NULL, NULL);
@@ -1054,9 +1046,9 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 	}
 
 	/* propagate changes */
-	// thread_isolate(); ACenterA Fix
-	// srv_update_status(s); ACenterA Fix
-	// thread_release(); ACenterA Fix
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Enables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
@@ -1100,11 +1092,10 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 	}
 
  end:
-        srv_register_update(s); // ACenterA Fix
 	/* propagate changes */
-	// thread_isolate();
-	// srv_update_status(s);
-	// thread_release();
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* Disables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
@@ -1143,11 +1134,10 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 	}
 
  end:
-        srv_register_update(s); // ACenterA Fix
 	/* propagate changes */
-	// thread_isolate();
-	// srv_update_status(s);
-	// thread_release();
+	thread_isolate();
+	srv_update_status(s);
+	thread_release();
 }
 
 /* principle: propagate maint and drain to tracking servers. This is useful
@@ -1227,7 +1217,6 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 __attribute__((constructor))
 static void __listener_init(void)
 {
-	HA_SPIN_INIT(&updated_servers_lock);
 	srv_register_keywords(&srv_kws);
 }
 
@@ -2729,18 +2718,6 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
 	}
 
 	return NULL;
-}
-
-/* Registers changes to be applied asynchronously */
-// ACenterA Fix
-static void srv_register_update(struct server *srv)
-{
-	if (LIST_ISEMPTY(&srv->update_status)) {
-		HA_SPIN_LOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
-		if (LIST_ISEMPTY(&srv->update_status))
-			LIST_ADDQ(&updated_servers, &srv->update_status);
-		HA_SPIN_UNLOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
-	}
 }
 
 /* Update a server state using the parameters available in the params list */
@@ -5158,24 +5135,6 @@ static void srv_update_status(struct server *s)
 
 	/* Re-set log strings to empty */
 	*s->adm_st_chg_cause = 0;
-}
-
-// ACenterA Fix
-/*
- * This function loops on servers registered for asynchronous
- * status changes
- *
- * NOTE: No needs to lock <updated_servers> list because it is called inside the
- * sync point.
- */
-void servers_update_status(void) {
-	struct server *s, *stmp;
-
-	list_for_each_entry_safe(s, stmp, &updated_servers, update_status) {
-		srv_update_status(s);
-		LIST_DEL(&s->update_status);
-		LIST_INIT(&s->update_status);
-	}
 }
 
 /*
