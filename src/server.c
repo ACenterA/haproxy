@@ -950,6 +950,7 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
+        srv_register_update(s); // ACenterA Fix
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopped(srv, NULL, NULL);
@@ -957,9 +958,9 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 	}
 
 	/* propagate changes */
-	thread_isolate();
-	srv_update_status(s);
-	thread_release();
+	// thread_isolate(); // ACenterA Fix
+	// srv_update_status(s);
+	// thread_release();
 }
 
 /* Marks server <s> up regardless of its checks' statuses and provided it isn't
@@ -995,6 +996,7 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 	if (s->slowstart <= 0)
 		s->next_state = SRV_ST_RUNNING;
 
+        srv_register_update(s); // ACenterA Fix
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_running(srv, NULL, NULL);
@@ -1002,9 +1004,9 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 	}
 
 	/* propagate changes */
-	thread_isolate();
-	srv_update_status(s);
-	thread_release();
+	// thread_isolate(); ACenterA fix
+	// srv_update_status(s); ACenterA fix
+	// thread_release(); ACenterA fix
 }
 
 /* Marks server <s> stopping regardless of its checks' statuses and provided it
@@ -1039,6 +1041,7 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
+        srv_register_update(s); // ACenterA Fix
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopping(srv, NULL, NULL);
@@ -1046,9 +1049,9 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 	}
 
 	/* propagate changes */
-	thread_isolate();
-	srv_update_status(s);
-	thread_release();
+	// thread_isolate(); ACenterA Fix
+	// srv_update_status(s); ACenterA Fix
+	// thread_release(); ACenterA Fix
 }
 
 /* Enables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
@@ -1092,10 +1095,11 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 	}
 
  end:
+        srv_register_update(s); // ACenterA Fix
 	/* propagate changes */
-	thread_isolate();
-	srv_update_status(s);
-	thread_release();
+	// thread_isolate();
+	// srv_update_status(s);
+	// thread_release();
 }
 
 /* Disables admin flag <mode> (among SRV_ADMF_*) on server <s>. This is used to
@@ -1134,10 +1138,11 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 	}
 
  end:
+        srv_register_update(s); // ACenterA Fix
 	/* propagate changes */
-	thread_isolate();
-	srv_update_status(s);
-	thread_release();
+	// thread_isolate();
+	// srv_update_status(s);
+	// thread_release();
 }
 
 /* principle: propagate maint and drain to tracking servers. This is useful

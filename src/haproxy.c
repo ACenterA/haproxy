@@ -2375,6 +2375,16 @@ void mworker_pipe_register()
 	fd_want_recv(mworker_pipe[0]);
 }
 
+/* Added back the commit 3ff577 broke the haproxy in our case */
+static inline void servers_check_for_updates()	
+{	
+	if (!LIST_ISEMPTY(&updated_servers)) {	
+		thread_isolate();	
+		servers_update_status();	
+		thread_release();	
+	}	
+}
+
 /* Runs the polling loop */
 static void run_poll_loop()
 {
@@ -2420,6 +2430,9 @@ static void run_poll_loop()
 		if (sleeping_thread_mask & tid_bit)
 			HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
 		fd_process_cached_events();
+
+	        /* check for server status updates */	
+		servers_check_for_updates();
 
 		activity[tid].loops++;
 	}
