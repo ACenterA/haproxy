@@ -314,6 +314,7 @@ struct server {
 		int nb_low;
 		int nb_high;
 	} tmpl_info;
+	struct list update_status;
 	struct {
 		long duration;
 		short status, code;
