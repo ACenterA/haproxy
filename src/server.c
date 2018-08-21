@@ -49,6 +49,7 @@
 struct list updated_servers = LIST_HEAD_INIT(updated_servers);
 __decl_hathreads(HA_SPINLOCK_T updated_servers_lock);
 
+static void srv_register_update(struct server *srv); //ACenterA Fix
 static void srv_update_status(struct server *s);
 static void srv_update_state(struct server *srv, int version, char **params);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
@@ -2728,6 +2729,18 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
 	}
 
 	return NULL;
+}
+
+/* Registers changes to be applied asynchronously */
+// ACenterA Fix
+static void srv_register_update(struct server *srv)
+{
+	if (LIST_ISEMPTY(&srv->update_status)) {
+		HA_SPIN_LOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
+		if (LIST_ISEMPTY(&srv->update_status))
+			LIST_ADDQ(&updated_servers, &srv->update_status);
+		HA_SPIN_UNLOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
+	}
 }
 
 /* Update a server state using the parameters available in the params list */
