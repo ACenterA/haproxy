@@ -760,8 +760,14 @@ wake_others:
 struct task *si_cs_io_cb(struct task *t, void *ctx, unsigned short state)
 {
 	struct stream_interface *si = ctx;
-	if (!(si->wait_list.wait_reason & SUB_CAN_SEND))
-		si_cs_send(__objt_cs(si->end));
+	struct conn_stream *cs = objt_cs(si->end);
+
+	if (!cs)
+		return NULL;
+	if (!(si->wait_list.wait_reason & SUB_CAN_SEND)) {
+		si_cs_send(cs);
+		si_cs_wake_cb(cs);
+	}
 	return (NULL);
 }
 

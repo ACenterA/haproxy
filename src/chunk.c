@@ -149,10 +149,9 @@ int chunk_printf(struct buffer *chk, const char *fmt, ...)
 	va_start(argp, fmt);
 	ret = vsnprintf(chk->area, chk->size, fmt, argp);
 	va_end(argp);
-	chk->data = ret;
 
 	if (ret >= chk->size)
-		ret = -1;
+		return -1;
 
 	chk->data = ret;
 	return chk->data;
@@ -168,7 +167,7 @@ int chunk_appendf(struct buffer *chk, const char *fmt, ...)
 	va_list argp;
 	int ret;
 
-	if (chk->data < 0 || !chk->area || !chk->size)
+	if (!chk->area || !chk->size)
 		return 0;
 
 	va_start(argp, fmt);
@@ -193,9 +192,6 @@ int chunk_htmlencode(struct buffer *dst, struct buffer *src)
 	int i, l;
 	int olen, free;
 	char c;
-
-	if (dst->data < 0)
-		return dst->data;
 
 	olen = dst->data;
 
@@ -238,9 +234,6 @@ int chunk_asciiencode(struct buffer *dst, struct buffer *src, char qc)
 	int i, l;
 	int olen, free;
 	char c;
-
-	if (dst->data < 0)
-		return dst->data;
 
 	olen = dst->data;
 
